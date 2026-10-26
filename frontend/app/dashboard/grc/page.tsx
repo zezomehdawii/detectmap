@@ -38,10 +38,12 @@ import {
   GRCFrameworkSummary,
   GRCMapping,
   GRCScorecardRow,
+  apiErrorMessage,
   deleteGRCMapping,
   downloadReport,
   getGRCFrameworkCoverage,
   getGRCScorecard,
+  isCustomerSelectionError,
   listGRCControlD3FEND,
   listGRCFrameworks,
   listGRCMappings,
@@ -83,8 +85,17 @@ export default function GRCPage() {
         setFrameworks(rows);
         if (rows.length && !selectedKey) setSelectedKey(rows[0].key);
       })
-      .catch((e) => setError(e?.response?.data?.detail ?? 'failed to load frameworks'));
-    getGRCScorecard().then(setScorecard).catch(() => setScorecard([]));
+      .catch((e) => setError(apiErrorMessage(e, 'failed to load frameworks')));
+    getGRCScorecard()
+      .then(setScorecard)
+      .catch((e) => {
+        setScorecard([]);
+        // The scorecard is secondary, so only surface it when the failure is
+        // the actionable "no customer selected" case.
+        if (isCustomerSelectionError(e)) {
+          setError(apiErrorMessage(e, 'failed to load scorecard'));
+        }
+      });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -101,8 +112,10 @@ export default function GRCPage() {
       }
     } catch (e: any) {
       setError(
-        e?.response?.data?.detail ??
+        apiErrorMessage(
+          e,
           'failed to load coverage — pick a customer in the topbar if you are an MSSP user.',
+        ),
       );
     } finally {
       setLoading(false);
@@ -464,7 +477,7 @@ function MappingEditor({
       setMappings(r);
       setD3fend(d3);
     } catch (e: any) {
-      setError(e?.response?.data?.detail ?? 'failed to load mappings');
+      setError(apiErrorMessage(e, 'failed to load mappings'));
     } finally {
       setLoading(false);
     }
@@ -497,7 +510,7 @@ function MappingEditor({
       await reload();
       onChanged();
     } catch (e: any) {
-      setError(e?.response?.data?.detail ?? 'add failed');
+      setError(apiErrorMessage(e, 'add failed'));
     } finally {
       setSubmitting(false);
     }
@@ -510,7 +523,7 @@ function MappingEditor({
       await reload();
       onChanged();
     } catch (e: any) {
-      setError(e?.response?.data?.detail ?? 'remove failed');
+      setError(apiErrorMessage(e, 'remove failed'));
     }
   }
 

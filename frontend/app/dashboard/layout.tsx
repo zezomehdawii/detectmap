@@ -36,6 +36,7 @@ import SearchRoundedIcon from '@mui/icons-material/SearchRounded';
 import NotificationsActiveRoundedIcon from '@mui/icons-material/NotificationsActiveRounded';
 import GridViewRoundedIcon from '@mui/icons-material/GridViewRounded';
 import GridOnRoundedIcon from '@mui/icons-material/GridOnRounded';
+import FactCheckRoundedIcon from '@mui/icons-material/FactCheckRounded';
 import GroupsRoundedIcon from '@mui/icons-material/GroupsRounded';
 import ReportProblemRoundedIcon from '@mui/icons-material/ReportProblemRounded';
 import StorageRoundedIcon from '@mui/icons-material/StorageRounded';
@@ -94,6 +95,7 @@ const NAV: NavGroup[] = [
     items: [
       { label: 'Dashboard', href: '/dashboard', icon: <GridViewRoundedIcon fontSize="small" /> },
       { label: 'Coverage Matrix', href: '/dashboard/coverage', icon: <GridOnRoundedIcon fontSize="small" /> },
+      { label: 'Verified Coverage', href: '/dashboard/verified', icon: <FactCheckRoundedIcon fontSize="small" /> },
       { label: 'APT Coverage', href: '/dashboard/apt', icon: <GroupsRoundedIcon fontSize="small" /> },
       { label: 'Gap Analysis', href: '/dashboard/gaps', icon: <ReportProblemRoundedIcon fontSize="small" /> },
       { label: 'Collection (CMF)', href: '/dashboard/cmf', icon: <StorageRoundedIcon fontSize="small" /> },

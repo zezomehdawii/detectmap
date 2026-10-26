@@ -28,6 +28,7 @@ from app.api import roles as roles_router
 from app.api import saved_views as saved_views_router
 from app.api import search as search_router
 from app.api import settings as settings_router
+from app.api import verified as verified_router
 from app.config import settings
 from app.db.tenant import set_tenant
 
@@ -103,3 +104,4 @@ app.include_router(assets_router.router)
 app.include_router(cmf_router.router)
 app.include_router(cmf_plan_router.router)
 app.include_router(diagrams_router.router)
+app.include_router(verified_router.router)

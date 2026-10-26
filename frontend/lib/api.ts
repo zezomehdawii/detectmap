@@ -9,6 +9,34 @@ import {
 const baseURL =
   process.env.NEXT_PUBLIC_API_BASE ?? 'http://localhost:8000';
 
+export const CUSTOMER_SELECTION_REQUIRED_MESSAGE =
+  'Please choose customer portfolio from the right-upper list.';
+
+type ApiErrorLike = {
+  response?: { data?: { detail?: unknown } };
+};
+
+function _errorDetail(err: unknown): unknown {
+  return (err as ApiErrorLike | null | undefined)?.response?.data?.detail;
+}
+
+export function isCustomerSelectionError(err: unknown): boolean {
+  const detail = _errorDetail(err);
+  return (
+    typeof detail === 'string' &&
+    (detail === CUSTOMER_SELECTION_REQUIRED_MESSAGE ||
+      detail.toLowerCase().includes('x-customer header required'))
+  );
+}
+
+export function apiErrorMessage(err: unknown, fallback: string): string {
+  const detail = _errorDetail(err);
+  if (typeof detail !== 'string' || !detail.trim()) return fallback;
+  return isCustomerSelectionError(err)
+    ? CUSTOMER_SELECTION_REQUIRED_MESSAGE
+    : detail;
+}
+
 // ---- short-lived GET cache ------------------------------------------------
 // Pages fetch their data client-side on mount, so navigating away and back
 // re-fires the same GETs and shows a spinner each time. A small in-memory
@@ -91,6 +119,11 @@ api.interceptors.request.use((config) => {
 api.interceptors.response.use(
   (r) => r,
   (err) => {
+    // Translate the backend's developer-facing missing-tenant error into the
+    // user-facing instruction, regardless of which page triggered the call.
+    if (isCustomerSelectionError(err)) {
+      err.response.data.detail = CUSTOMER_SELECTION_REQUIRED_MESSAGE;
+    }
     if (err?.response?.status === 401 && typeof window !== 'undefined') {
       clearToken();
       // Wipe the cached user-preferences blob so the next user doesn't
@@ -1241,6 +1274,89 @@ export interface SiemOverlay {
 
 export async function getSiemOverlay(): Promise<SiemOverlay> {
   const { data } = await api.get<SiemOverlay>('/coverage/siem-overlay');
+  return data;
+}
+
+// ---- verified coverage (evidence ladder) ----
+export interface DeploymentMatch {
+  name: string;
+  connector: string;
+  enabled: boolean;
+  match_reason: string;
+}
+
+export interface DetectionEvidence {
+  id: string;
+  title: string;
+  sigma_id: string;
+  status: string;
+  source: string;
+  score_depth: number;
+  technique_ids: string[];
+  level: number;
+  level_label: string;
+  blockers: string[];
+  next_action: string;
+  deployed_matches: DeploymentMatch[];
+  samples_total: number;
+  samples_passed: number;
+  samples_failed: number;
+  samples_pending: number;
+  tp_count: number;
+  fp_count: number;
+  telemetry_state: string;
+  missing_data_sources: string[];
+}
+
+export interface TechniqueEvidence {
+  technique_id: string;
+  name: string;
+  tactics: string[];
+  is_subtechnique: boolean;
+  claimed_state: string;
+  visibility_state: string;
+  detection_count: number;
+  level: number;
+  level_label: string;
+  blockers: string[];
+  next_action: string;
+  detections: DetectionEvidence[];
+}
+
+export interface VerifiedCoverage {
+  domain: string;
+  generated_at: string;
+  total_techniques: number;
+  not_applicable_count: number;
+  designed_count: number;
+  claimed_deployed_count: number;
+  verified_deployed_count: number;
+  effective_count: number;
+  proven_count: number;
+  level_counts: Record<string, number>;
+  detections_total: number;
+  detection_level_counts: Record<string, number>;
+  techniques: TechniqueEvidence[];
+}
+
+export async function getVerifiedCoverage(
+  domain = 'enterprise',
+  includeDetails = false,
+): Promise<VerifiedCoverage> {
+  const { data } = await api.get<VerifiedCoverage>('/verified/coverage', {
+    params: { domain, include_details: includeDetails },
+  });
+  return data;
+}
+
+export async function getVerifiedTechnique(
+  techniqueId: string,
+  domain = 'enterprise',
+): Promise<TechniqueEvidence> {
+  const { data } = await api.get<TechniqueEvidence>(
+    `/verified/techniques/${encodeURIComponent(techniqueId)}`,
+    { params: { domain } },
+  );
   return data;
 }
 

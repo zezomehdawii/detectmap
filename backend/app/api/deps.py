@@ -200,7 +200,7 @@ def require_active_customer():
         if principal.customer is None:
             raise HTTPException(
                 400,
-                "X-Customer header required to scope this operation",
+                "Please choose customer portfolio from the right-upper list.",
             )
         return principal
     return _check
@@ -226,7 +226,7 @@ def require_feature(key: str, *, optional_customer: bool = False):
                 return principal
             raise HTTPException(
                 400,
-                "X-Customer header required to scope this feature",
+                "Please choose customer portfolio from the right-upper list.",
             )
         if not customer_features.is_enabled(principal.customer.features, key):
             raise HTTPException(
