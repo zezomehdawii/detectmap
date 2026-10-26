@@ -1,0 +1,35 @@
+# TLS-terminating Caddy reverse proxy.
+#
+# Activate alongside the base compose file:
+#     docker compose -f docker-compose.yml -f docker-compose.tls.yml up -d
+#
+# The interactive `setup.py` enables this overlay automatically when TLS
+# is selected. The base compose maps the backend and frontend to host
+# ports 8000 / 3000 for direct (HTTP) access; this overlay adds Caddy
+# on host port ${TLS_LISTEN_PORT} (default 8443) that terminates TLS
+# and proxies to the in-cluster frontend / backend by service name.
+#
+# Certificate sources:
+#   1. Caller drops cert.pem + key.pem into ./tls/ (relative to this
+#      compose file). The setup script does this for the "Generate
+#      self-signed" and "Use my certificate" flows.
+#   2. Caddyfile reads from /etc/caddy/cert.pem + /etc/caddy/key.pem.
+services:
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on:
+      - frontend
+      - backend
+    ports:
+      - "${TLS_LISTEN_PORT:-8443}:8443"
+    volumes:
+      - ./tls/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./tls/cert.pem:/etc/caddy/cert.pem:ro
+      - ./tls/key.pem:/etc/caddy/key.pem:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+volumes:
+  caddy_data:
+  caddy_config:

@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Interactive admin password reset. Run from inside the backend container:
+#     docker compose exec backend pass-reset
+# See `pass-reset --help` for non-interactive flags.
+exec python -m app.scripts.pass_reset "$@"

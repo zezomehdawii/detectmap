@@ -1,0 +1,6 @@
+# Local-only override: host port 3000 is taken by an unrelated container,
+# so expose the detectmap frontend on 3001 instead. Not committed-config intent.
+services:
+  frontend:
+    ports:
+      - "3001:3000"
