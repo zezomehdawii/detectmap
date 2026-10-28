@@ -37,6 +37,7 @@ from app.models.customer import (
     Connector,
     DeployedUseCase,
     Detection,
+    DetectionDeploymentLink,
     DetectionEventSample,
     DetectionOutcome,
     DetectionTechnique,
@@ -68,10 +69,12 @@ _TELEMETRY_READY_STATES = (VisibilityState.VISIBLE, VisibilityState.PARTIAL)
 
 @dataclass
 class DeploymentMatch:
+    id: str
     name: str
     connector: str
     enabled: bool
     match_reason: str
+    decision: Optional[str] = None  # None=heuristic, confirmed, rejected
 
 
 @dataclass
@@ -233,27 +236,45 @@ def _build_detection_evidence(
     deployments: list[DeployedUseCase],
     connector_names: dict,
     visibility_by_tid: dict[str, VisibilityCell],
+    deployment_decisions: Optional[dict[tuple, str]] = None,
 ) -> DetectionEvidence:
     status = (
         detection.detection_status.value
         if hasattr(detection.detection_status, "value")
         else str(detection.detection_status)
     )
+    decisions = deployment_decisions or {}
     matches: list[DeploymentMatch] = []
     for deployment in deployments:
+        decision = decisions.get((detection.id, deployment.id))
         reasons = _match_deployment(detection, deployment)
-        if not reasons:
+
+        # A rejection only suppresses a pair that the heuristic considered
+        # plausible in the first place. A confirmed pair is evidence even when
+        # the SIEM renamed the rule beyond the heuristic's reach.
+        if decision == "rejected" and not reasons:
             continue
+        if decision != "confirmed" and not reasons:
+            continue
+        if decision == "confirmed" and "confirmed" not in reasons:
+            reasons.append("confirmed")
+        if decision == "rejected":
+            reasons.append("rejected")
+
         matches.append(
             DeploymentMatch(
+                id=str(deployment.id),
                 name=deployment.name,
                 connector=connector_names.get(deployment.connector_id, "unknown"),
                 enabled=bool(deployment.enabled),
                 match_reason=", ".join(reasons),
+                decision=decision,
             )
         )
 
-    enabled_matches = [m for m in matches if m.enabled]
+    enabled_matches = [
+        match for match in matches if match.enabled and match.decision != "rejected"
+    ]
     samples_total = len(samples)
     samples_passed = sum(1 for sample in samples if sample.last_run_pass is True)
     samples_failed = sum(1 for sample in samples if sample.last_run_pass is False)
@@ -374,8 +395,15 @@ async def compute_verified_coverage(
         connector_rows = (
             await session.execute(select(Connector.id, Connector.label))
         ).all()
+        link_rows = (
+            await session.execute(select(DetectionDeploymentLink))
+        ).scalars().all()
 
     connector_names = {row[0]: row[1] for row in connector_rows}
+    deployment_decisions = {
+        (link.detection_id, link.deployed_use_case_id): link.status
+        for link in link_rows
+    }
     techniques_by_detection: dict = defaultdict(set)
     for mapping in mappings:
         techniques_by_detection[mapping.detection_id].add(mapping.technique_id)
@@ -413,6 +441,7 @@ async def compute_verified_coverage(
             deployments=deployment_rows,
             connector_names=connector_names,
             visibility_by_tid=visibility_by_tid,
+            deployment_decisions=deployment_decisions,
         )
         detection_evidence.append(evidence)
         for tid in technique_ids:

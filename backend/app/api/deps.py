@@ -34,6 +34,13 @@ from app.models.public import Customer, Role, SuperAdmin, User
 
 _bearer = HTTPBearer(auto_error=False)
 
+# Keep this in one place: the SPA also matches on it to turn the raw 400 into
+# a user-facing instruction. The wording names the control instead of its
+# screen position so it stays correct on narrow layouts.
+CUSTOMER_SELECTION_REQUIRED_MESSAGE = (
+    "Select a customer to continue. Use the customer switcher in the header."
+)
+
 
 @dataclass
 class TenantPrincipal:
@@ -198,10 +205,7 @@ def require_active_customer():
         principal: TenantPrincipal = Depends(current_tenant_user),
     ) -> TenantPrincipal:
         if principal.customer is None:
-            raise HTTPException(
-                400,
-                "Please choose customer portfolio from the right-upper list.",
-            )
+            raise HTTPException(400, CUSTOMER_SELECTION_REQUIRED_MESSAGE)
         return principal
     return _check
 
@@ -224,10 +228,7 @@ def require_feature(key: str, *, optional_customer: bool = False):
         if principal.customer is None:
             if optional_customer:
                 return principal
-            raise HTTPException(
-                400,
-                "Please choose customer portfolio from the right-upper list.",
-            )
+            raise HTTPException(400, CUSTOMER_SELECTION_REQUIRED_MESSAGE)
         if not customer_features.is_enabled(principal.customer.features, key):
             raise HTTPException(
                 403,

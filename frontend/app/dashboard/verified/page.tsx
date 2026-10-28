@@ -30,6 +30,9 @@ import ExpandLessRoundedIcon from '@mui/icons-material/ExpandLessRounded';
 import ExpandMoreRoundedIcon from '@mui/icons-material/ExpandMoreRounded';
 import FactCheckRoundedIcon from '@mui/icons-material/FactCheckRounded';
 import FilterAltOffRoundedIcon from '@mui/icons-material/FilterAltOffRounded';
+import CheckRoundedIcon from '@mui/icons-material/CheckRounded';
+import CloseRoundedIcon from '@mui/icons-material/CloseRounded';
+import UndoRoundedIcon from '@mui/icons-material/UndoRounded';
 import SearchRoundedIcon from '@mui/icons-material/SearchRounded';
 import WarningAmberRoundedIcon from '@mui/icons-material/WarningAmberRounded';
 
@@ -38,8 +41,10 @@ import {
   TechniqueEvidence,
   VerifiedCoverage,
   apiErrorMessage,
+  clearDeploymentDecision,
   getVerifiedCoverage,
   getVerifiedTechnique,
+  setDeploymentDecision,
 } from '@/lib/api';
 import { coverage } from '../../theme';
 
@@ -146,14 +151,9 @@ export default function VerifiedCoveragePage() {
   const total = data?.total_techniques ?? 0;
   const detectionDebt = data ? Math.max(0, data.designed_count - data.verified_deployed_count) : 0;
 
-  function toggleTechnique(technique: TechniqueEvidence) {
-    const tid = technique.technique_id;
-    const willOpen = expanded !== tid;
-    setExpanded(willOpen ? tid : null);
-    if (!willOpen || technique.detection_count === 0) return;
-
+  function loadTechniqueDetails(tid: string, force = false) {
     const cached = details[tid];
-    if (cached && !cached.error) return;
+    if (!force && cached && !cached.error) return;
 
     setDetails((current) => ({ ...current, [tid]: { loading: true } }));
     getVerifiedTechnique(tid)
@@ -171,6 +171,25 @@ export default function VerifiedCoveragePage() {
             error: apiErrorMessage(e, 'Failed to load detection evidence.'),
           },
         }));
+      });
+  }
+
+  function toggleTechnique(technique: TechniqueEvidence) {
+    const tid = technique.technique_id;
+    const willOpen = expanded !== tid;
+    setExpanded(willOpen ? tid : null);
+    if (!willOpen || technique.detection_count === 0) return;
+    loadTechniqueDetails(tid);
+  }
+
+  function refreshSummary() {
+    // A decision changes the technique's level and the headline counters, so
+    // pull the small summary again after the detail reload. The mutation
+    // cleared the GET cache, so this reflects the new decision.
+    getVerifiedCoverage()
+      .then(setData)
+      .catch(() => {
+        /* the detail panel already shows any actionable error */
       });
   }
 
@@ -524,6 +543,11 @@ export default function VerifiedCoveragePage() {
                                       <DetectionCard
                                         key={detection.id}
                                         detection={detection}
+                                        canEdit={data.can_edit}
+                                        onMatchChanged={() => {
+                                          loadTechniqueDetails(technique.technique_id, true);
+                                          refreshSummary();
+                                        }}
                                       />
                                     ))
                                   )}
@@ -603,8 +627,41 @@ function SummaryCard({
   );
 }
 
-function DetectionCard({ detection }: { detection: DetectionEvidence }) {
+function DetectionCard({
+  detection,
+  canEdit,
+  onMatchChanged,
+}: {
+  detection: DetectionEvidence;
+  canEdit: boolean;
+  onMatchChanged?: () => void;
+}) {
   const evidence = levelMeta(detection.level);
+  const [busyMatch, setBusyMatch] = useState<string | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
+
+  async function decide(
+    matchId: string,
+    status: 'confirmed' | 'rejected' | 'auto',
+  ) {
+    setBusyMatch(matchId);
+    setActionError(null);
+    try {
+      if (status === 'auto') {
+        await clearDeploymentDecision(detection.id, matchId);
+      } else {
+        await setDeploymentDecision(detection.id, matchId, status);
+      }
+      onMatchChanged?.();
+    } catch (e) {
+      setActionError(
+        apiErrorMessage(e, 'Failed to update the deployment match.'),
+      );
+    } finally {
+      setBusyMatch(null);
+    }
+  }
+
   return (
     <Paper variant="outlined" sx={{ p: 1.5 }}>
       <Stack
@@ -658,19 +715,88 @@ function DetectionCard({ detection }: { detection: DetectionEvidence }) {
         <strong>Next:</strong> {detection.next_action}
       </Typography>
 
+      {actionError && (
+        <Alert severity="error" sx={{ mt: 1 }} onClose={() => setActionError(null)}>
+          {actionError}
+        </Alert>
+      )}
+
       {detection.deployed_matches.length > 0 && (
         <>
           <Divider sx={{ my: 1 }} />
           <Stack direction="row" spacing={0.75} flexWrap="wrap" useFlexGap>
-            {detection.deployed_matches.map((match, index) => (
-              <Chip
-                key={`${match.connector}-${match.name}-${index}`}
-                size="small"
-                variant="outlined"
-                color={match.enabled ? 'success' : 'default'}
-                label={`${match.connector}: ${match.name}${match.enabled ? '' : ' (disabled)'}`}
-              />
-            ))}
+            {detection.deployed_matches.map((match) => {
+              const rejected = match.decision === 'rejected';
+              const confirmed = match.decision === 'confirmed';
+              return (
+                <Stack
+                  key={match.id}
+                  direction="row"
+                  spacing={0.25}
+                  alignItems="center"
+                >
+                  <Chip
+                    size="small"
+                    variant="outlined"
+                    color={rejected ? 'default' : match.enabled ? 'success' : 'default'}
+                    label={`${match.connector}: ${match.name}${
+                      match.enabled ? '' : ' (disabled)'
+                    }${rejected ? ' (rejected)' : ''}`}
+                    sx={rejected ? { textDecoration: 'line-through' } : undefined}
+                  />
+                  {confirmed && (
+                    <Chip
+                      size="small"
+                      variant="outlined"
+                      color="success"
+                      label="confirmed"
+                    />
+                  )}
+                  {canEdit && !rejected && !confirmed && (
+                    <Tooltip title="Confirm this is the deployed rule">
+                      <span>
+                        <IconButton
+                          size="small"
+                          aria-label="Confirm deployment match"
+                          disabled={busyMatch === match.id}
+                          onClick={() => decide(match.id, 'confirmed')}
+                        >
+                          <CheckRoundedIcon fontSize="small" />
+                        </IconButton>
+                      </span>
+                    </Tooltip>
+                  )}
+                  {canEdit && !rejected && (
+                    <Tooltip title="Reject this match">
+                      <span>
+                        <IconButton
+                          size="small"
+                          aria-label="Reject deployment match"
+                          disabled={busyMatch === match.id}
+                          onClick={() => decide(match.id, 'rejected')}
+                        >
+                          <CloseRoundedIcon fontSize="small" />
+                        </IconButton>
+                      </span>
+                    </Tooltip>
+                  )}
+                  {canEdit && rejected && (
+                    <Tooltip title="Restore automatic matching">
+                      <span>
+                        <IconButton
+                          size="small"
+                          aria-label="Restore automatic matching"
+                          disabled={busyMatch === match.id}
+                          onClick={() => decide(match.id, 'auto')}
+                        >
+                          <UndoRoundedIcon fontSize="small" />
+                        </IconButton>
+                      </span>
+                    </Tooltip>
+                  )}
+                </Stack>
+              );
+            })}
           </Stack>
         </>
       )}

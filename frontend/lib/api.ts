@@ -10,7 +10,14 @@ const baseURL =
   process.env.NEXT_PUBLIC_API_BASE ?? 'http://localhost:8000';
 
 export const CUSTOMER_SELECTION_REQUIRED_MESSAGE =
-  'Please choose customer portfolio from the right-upper list.';
+  'Select a customer to continue. Use the customer switcher in the header.';
+
+// Older backends returned a layout-specific wording. Keep recognizing it so a
+// mixed deployment still surfaces the normalized message instead of the raw
+// API detail.
+const LEGACY_CUSTOMER_SELECTION_MESSAGES = [
+  'please choose customer portfolio from the right-upper list.',
+];
 
 type ApiErrorLike = {
   response?: { data?: { detail?: unknown } };
@@ -25,7 +32,8 @@ export function isCustomerSelectionError(err: unknown): boolean {
   return (
     typeof detail === 'string' &&
     (detail === CUSTOMER_SELECTION_REQUIRED_MESSAGE ||
-      detail.toLowerCase().includes('x-customer header required'))
+      detail.toLowerCase().includes('x-customer header required') ||
+      LEGACY_CUSTOMER_SELECTION_MESSAGES.includes(detail.toLowerCase()))
   );
 }
 
@@ -1279,10 +1287,12 @@ export async function getSiemOverlay(): Promise<SiemOverlay> {
 
 // ---- verified coverage (evidence ladder) ----
 export interface DeploymentMatch {
+  id: string;
   name: string;
   connector: string;
   enabled: boolean;
   match_reason: string;
+  decision: 'confirmed' | 'rejected' | null;
 }
 
 export interface DetectionEvidence {
@@ -1336,6 +1346,7 @@ export interface VerifiedCoverage {
   level_counts: Record<string, number>;
   detections_total: number;
   detection_level_counts: Record<string, number>;
+  can_edit: boolean;
   techniques: TechniqueEvidence[];
 }
 
@@ -1358,6 +1369,27 @@ export async function getVerifiedTechnique(
     { params: { domain } },
   );
   return data;
+}
+
+export async function setDeploymentDecision(
+  detectionId: string,
+  deploymentId: string,
+  status: 'confirmed' | 'rejected',
+  note?: string,
+): Promise<void> {
+  await api.put(
+    `/verified/matches/${encodeURIComponent(detectionId)}/${encodeURIComponent(deploymentId)}`,
+    { status, note },
+  );
+}
+
+export async function clearDeploymentDecision(
+  detectionId: string,
+  deploymentId: string,
+): Promise<void> {
+  await api.delete(
+    `/verified/matches/${encodeURIComponent(detectionId)}/${encodeURIComponent(deploymentId)}`,
+  );
 }
 
 // ---- technique detail ----

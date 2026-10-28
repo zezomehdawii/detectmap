@@ -1,11 +1,28 @@
 """Verified-coverage API — evidence ladder for the active tenant."""
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel
+import uuid
+from typing import Literal, Optional
 
-from app.api.deps import TenantPrincipal, require_active_customer, require_perm
-from app.core.rbac import Permission
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
+from pydantic import BaseModel
+from sqlalchemy import select
+
+from app.api.deps import (
+    TenantPrincipal,
+    require_active_customer,
+    require_feature,
+    require_perm,
+)
+from app.core.rbac import Permission, role_has
+from app.db.tenant import tenant_session
+from app.models.customer import (
+    DeployedUseCase,
+    Detection,
+    DetectionDeploymentLink,
+)
+from app.services import customer_features
+from app.services.roles import user_has_permission
 from app.services.verified_coverage import (
     DetectionEvidence,
     TechniqueEvidence,
@@ -17,10 +34,12 @@ router = APIRouter(prefix="/verified", tags=["verified"])
 
 
 class DeploymentMatchOut(BaseModel):
+    id: str
     name: str
     connector: str
     enabled: bool
     match_reason: str
+    decision: Optional[str] = None
 
 
 class DetectionEvidenceOut(BaseModel):
@@ -74,7 +93,33 @@ class VerifiedCoverageOut(BaseModel):
     level_counts: dict[str, int]
     detections_total: int
     detection_level_counts: dict[str, int]
+    can_edit: bool
     techniques: list[TechniqueEvidenceOut]
+
+
+class DeploymentDecisionIn(BaseModel):
+    status: Literal["confirmed", "rejected"]
+    note: Optional[str] = None
+
+
+class DeploymentDecisionOut(BaseModel):
+    detection_id: str
+    deployed_use_case_id: str
+    status: str
+
+
+async def _can_edit(principal: TenantPrincipal) -> bool:
+    if principal.customer is None:
+        return False
+    if not customer_features.is_enabled(
+        principal.customer.features, "detection_editing"
+    ):
+        return False
+    if principal.user.custom_role_id is None:
+        return role_has(principal.user.role, Permission.DETECTION_WRITE)
+    return await user_has_permission(
+        principal.user, Permission.DETECTION_WRITE
+    )
 
 
 def _detection_out(item: DetectionEvidence) -> DetectionEvidenceOut:
@@ -92,10 +137,12 @@ def _detection_out(item: DetectionEvidence) -> DetectionEvidenceOut:
         next_action=item.next_action,
         deployed_matches=[
             DeploymentMatchOut(
+                id=match.id,
                 name=match.name,
                 connector=match.connector,
                 enabled=match.enabled,
                 match_reason=match.match_reason,
+                decision=match.decision,
             )
             for match in item.deployed_matches
         ],
@@ -143,7 +190,7 @@ async def get_verified_coverage(
             "summary table and fetch /verified/techniques/{id} on demand."
         ),
     ),
-    _: TenantPrincipal = Depends(require_perm(Permission.COVERAGE_READ)),
+    principal: TenantPrincipal = Depends(require_perm(Permission.COVERAGE_READ)),
     __: TenantPrincipal = Depends(require_active_customer()),
 ) -> VerifiedCoverageOut:
     """Return the evidence ladder for every applicable technique in scope."""
@@ -161,6 +208,7 @@ async def get_verified_coverage(
         level_counts=result.level_counts,
         detections_total=result.detections_total,
         detection_level_counts=result.detection_level_counts,
+        can_edit=await _can_edit(principal),
         techniques=[
             _technique_out(item, include_details=include_details)
             for item in result.techniques
@@ -188,3 +236,103 @@ async def get_verified_technique(
         if item.technique_id == technique_id:
             return _technique_out(item, include_details=True)
     raise HTTPException(404, f"technique not found in scope: {technique_id}")
+
+
+@router.put(
+    "/matches/{detection_id}/{deployed_use_case_id}",
+    response_model=DeploymentDecisionOut,
+)
+async def set_deployment_decision(
+    detection_id: uuid.UUID,
+    deployed_use_case_id: uuid.UUID,
+    payload: DeploymentDecisionIn,
+    principal: TenantPrincipal = Depends(
+        require_perm(Permission.DETECTION_WRITE)
+    ),
+    __: TenantPrincipal = Depends(require_active_customer()),
+    ___: TenantPrincipal = Depends(require_feature("detection_editing")),
+) -> DeploymentDecisionOut:
+    """Confirm or reject a curated-detection ↔ deployed-rule pair.
+
+    Confirmation is persisted as evidence; rejection suppresses a heuristic
+    match. Omitting a row keeps the automatic heuristic in charge.
+    """
+    async with tenant_session() as session:
+        detection = (
+            await session.execute(
+                select(Detection).where(Detection.id == detection_id)
+            )
+        ).scalar_one_or_none()
+        if detection is None:
+            raise HTTPException(404, "detection not found")
+
+        deployment = (
+            await session.execute(
+                select(DeployedUseCase).where(
+                    DeployedUseCase.id == deployed_use_case_id
+                )
+            )
+        ).scalar_one_or_none()
+        if deployment is None:
+            raise HTTPException(404, "deployed use-case not found")
+
+        link = (
+            await session.execute(
+                select(DetectionDeploymentLink).where(
+                    DetectionDeploymentLink.detection_id == detection_id,
+                    DetectionDeploymentLink.deployed_use_case_id
+                    == deployed_use_case_id,
+                )
+            )
+        ).scalar_one_or_none()
+
+        if link is None:
+            link = DetectionDeploymentLink(
+                id=uuid.uuid4(),
+                detection_id=detection_id,
+                deployed_use_case_id=deployed_use_case_id,
+                status=payload.status,
+                note=payload.note,
+                created_by_email=principal.user.email,
+            )
+            session.add(link)
+        else:
+            link.status = payload.status
+            if payload.note is not None:
+                link.note = payload.note
+        link.updated_by_email = principal.user.email
+        await session.flush()
+
+    return DeploymentDecisionOut(
+        detection_id=str(detection_id),
+        deployed_use_case_id=str(deployed_use_case_id),
+        status=payload.status,
+    )
+
+
+@router.delete(
+    "/matches/{detection_id}/{deployed_use_case_id}",
+    status_code=204,
+    response_class=Response,
+)
+async def clear_deployment_decision(
+    detection_id: uuid.UUID,
+    deployed_use_case_id: uuid.UUID,
+    _: TenantPrincipal = Depends(require_perm(Permission.DETECTION_WRITE)),
+    __: TenantPrincipal = Depends(require_active_customer()),
+    ___: TenantPrincipal = Depends(require_feature("detection_editing")),
+) -> Response:
+    """Remove a confirmation/rejection and return to automatic matching."""
+    async with tenant_session() as session:
+        link = (
+            await session.execute(
+                select(DetectionDeploymentLink).where(
+                    DetectionDeploymentLink.detection_id == detection_id,
+                    DetectionDeploymentLink.deployed_use_case_id
+                    == deployed_use_case_id,
+                )
+            )
+        ).scalar_one_or_none()
+        if link is not None:
+            await session.delete(link)
+    return Response(status_code=204)

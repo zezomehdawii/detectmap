@@ -14,6 +14,7 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import text
 
+from app.api.deps import CUSTOMER_SELECTION_REQUIRED_MESSAGE
 from app.db.base import AsyncSessionLocal
 from app.db.tenant import set_tenant
 from app.main import app
@@ -46,6 +47,7 @@ def _detection(**overrides):
 
 def _deployment(**overrides):
     values = {
+        "id": uuid.uuid4(),
         "name": "Suspicious PowerShell Encoded Command",
         "connector_id": uuid.uuid4(),
         "enabled": True,
@@ -87,6 +89,7 @@ def _evidence(
     deployments=None,
     visibility=None,
     connector_names=None,
+    deployment_decisions=None,
 ):
     return _build_detection_evidence(
         detection=detection or _detection(),
@@ -96,6 +99,7 @@ def _evidence(
         deployments=deployments or [],
         connector_names=connector_names or {},
         visibility_by_tid=visibility or {},
+        deployment_decisions=deployment_decisions or {},
     )
 
 
@@ -305,6 +309,64 @@ class TestEvidenceLadder:
         assert evidence.tp_count == 0
 
 
+class TestDeploymentDecisions:
+    def test_confirmed_pair_is_evidence_without_heuristic(self) -> None:
+        detection = _detection(title="Encoded PowerShell", sigma_id="sigma-1")
+        deployment = _deployment(name="SIEM Rule 17", external_id="siem-17")
+        evidence = _evidence(
+            detection=detection,
+            samples=[_sample(True)],
+            deployments=[deployment],
+            deployment_decisions={(detection.id, deployment.id): "confirmed"},
+        )
+        assert evidence.level == 4
+        match = evidence.deployed_matches[0]
+        assert match.id == str(deployment.id)
+        assert match.decision == "confirmed"
+        assert "confirmed" in match.match_reason
+
+    def test_rejected_pair_suppresses_heuristic(self) -> None:
+        detection = _detection()
+        deployment = _deployment()  # matching title and sigma id
+        evidence = _evidence(
+            detection=detection,
+            samples=[_sample(True)],
+            deployments=[deployment],
+            deployment_decisions={(detection.id, deployment.id): "rejected"},
+        )
+        assert evidence.level == 3
+        assert evidence.deployed_matches[0].decision == "rejected"
+        assert "rejected" in evidence.deployed_matches[0].match_reason
+        assert "No enabled matching SIEM rule" in evidence.blockers
+
+    def test_rejected_pair_without_heuristic_is_not_listed(self) -> None:
+        detection = _detection(title="Encoded PowerShell", sigma_id="sigma-1")
+        deployment = _deployment(name="SIEM Rule 17", external_id="siem-17")
+        evidence = _evidence(
+            detection=detection,
+            samples=[_sample(True)],
+            deployments=[deployment],
+            deployment_decisions={(detection.id, deployment.id): "rejected"},
+        )
+        assert evidence.level == 3
+        assert evidence.deployed_matches == []
+
+    def test_disabled_confirmed_pair_does_not_verify(self) -> None:
+        detection = _detection(title="Encoded PowerShell", sigma_id="sigma-1")
+        deployment = _deployment(
+            name="SIEM Rule 17", external_id="siem-17", enabled=False
+        )
+        evidence = _evidence(
+            detection=detection,
+            samples=[_sample(True)],
+            deployments=[deployment],
+            deployment_decisions={(detection.id, deployment.id): "confirmed"},
+        )
+        assert evidence.level == 3
+        assert evidence.deployed_matches[0].decision == "confirmed"
+        assert evidence.deployed_matches[0].enabled is False
+
+
 class TestNextAction:
     def test_mapping_action_is_preferred_when_mapping_is_missing(self) -> None:
         action = _next_action(1, "idea", ["No ATT&CK technique mapping"])
@@ -383,9 +445,20 @@ class TestVerifiedCoverageEndpoint:
         ) as c:
             response = await c.get("/verified/coverage")
         assert response.status_code == 400
-        assert response.json()["detail"] == (
-            "Please choose customer portfolio from the right-upper list."
-        )
+        assert response.json()["detail"] == CUSTOMER_SELECTION_REQUIRED_MESSAGE
+
+    async def test_readonly_role_gets_readonly_coverage(
+        self, demo_readonly_token
+    ) -> None:
+        if not await _acme_exists():
+            pytest.skip("cust_acme schema not provisioned — run seed_demo first")
+        async with _client(demo_readonly_token) as c:
+            response = await c.get(
+                "/verified/coverage",
+                params={"domain": "enterprise", "include_details": "false"},
+            )
+        assert response.status_code == 200, response.text
+        assert response.json()["can_edit"] is False
 
 
 async def _globex_exists() -> bool:

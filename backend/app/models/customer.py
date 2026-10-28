@@ -222,6 +222,53 @@ class DeployedUseCase(CustomerBase):
     )
 
 
+class DetectionDeploymentLink(CustomerBase):
+    """Analyst decision linking a curated detection to a deployed SIEM rule.
+
+    The verified-coverage engine infers matches from Sigma IDs and titles at
+    read time. That heuristic is useful but deliberately conservative; this
+    table lets an analyst confirm a match (including one the heuristic would
+    miss) or reject a false positive without mutating either source row.
+    """
+    __tablename__ = "detection_deployment_links"
+    __table_args__ = (
+        UniqueConstraint(
+            "detection_id",
+            "deployed_use_case_id",
+            name="uq_detection_deployment_link",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = uuid_pk()
+    detection_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("detections.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    deployed_use_case_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("deployed_use_cases.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    # 'confirmed' counts the pair as verified evidence; 'rejected' suppresses
+    # a heuristic match. No row means "use the automatic heuristic".
+    status: Mapped[str] = mapped_column(String(20), nullable=False)
+    note: Mapped[Optional[str]] = mapped_column(Text)
+    created_by_email: Mapped[Optional[str]] = mapped_column(String(320))
+    updated_by_email: Mapped[Optional[str]] = mapped_column(String(320))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+
 class CoverageSnapshot(CustomerBase):
     """Point-in-time roll-up of coverage posture for audit history & reports."""
     __tablename__ = "coverage_snapshots"
