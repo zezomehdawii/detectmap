@@ -32,6 +32,7 @@ from app.models.customer import (
     Connector,
     CoverageSnapshot,
     Detection,
+    DetectionReviewStatus,
     DetectionSource,
     DetectionStatus,
     DetectionTechnique,
@@ -344,6 +345,16 @@ async def _seed_custom_detections(codename: str) -> None:
                         source=DetectionSource.CUSTOM,
                         score_breadth=2,
                         score_depth=spec["depth"],
+                        review_status=(
+                            DetectionReviewStatus.APPROVED.value
+                            if spec["status"] == DetectionStatus.DEPLOYED
+                            else DetectionReviewStatus.DRAFT.value
+                        ),
+                        reviewed_at=(
+                            datetime.now(timezone.utc)
+                            if spec["status"] == DetectionStatus.DEPLOYED
+                            else None
+                        ),
                     )
                 )
                 for t in spec["techniques"]:
@@ -419,6 +430,16 @@ async def _seed_customized_forks(codename: str) -> None:
                         score_breadth=upstream.score_breadth,
                         score_depth=fork["depth"],
                         upstream_global_id=upstream.sigma_id,
+                        review_status=(
+                            DetectionReviewStatus.APPROVED.value
+                            if fork["status"] == DetectionStatus.DEPLOYED
+                            else DetectionReviewStatus.DRAFT.value
+                        ),
+                        reviewed_at=(
+                            datetime.now(timezone.utc)
+                            if fork["status"] == DetectionStatus.DEPLOYED
+                            else None
+                        ),
                     )
                 )
                 # Copy upstream's technique mappings onto the fork.

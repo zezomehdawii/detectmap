@@ -1024,6 +1024,16 @@ export async function patchCustomerFeatures(
 }
 
 // ---- detections ----
+export interface DetectionReviewEvent {
+  id: string;
+  action: string;
+  from_status: string;
+  to_status: string;
+  note: string | null;
+  actor_email: string | null;
+  created_at: string;
+}
+
 export interface DetectionListItem {
   id: string;
   sigma_id: string;
@@ -1037,6 +1047,8 @@ export interface DetectionListItem {
   upstream_global_id: string | null;
   tags: string[];
   techniques: string[];
+  owner: string | null;
+  review_status: string;
 }
 
 export interface DetectionDetail extends DetectionListItem {
@@ -1047,6 +1059,12 @@ export interface DetectionDetail extends DetectionListItem {
   detection: Record<string, unknown>;
   falsepositives: string[];
   raw_yaml: string | null;
+  reviewer_email: string | null;
+  review_requested_at: string | null;
+  reviewed_at: string | null;
+  review_due_at: string | null;
+  review_note: string | null;
+  review_events: DetectionReviewEvent[];
 }
 
 export interface PaginatedDetections {
@@ -1061,6 +1079,7 @@ export interface DetectionFilters {
   source?: string;
   technique_id?: string;
   level?: string;
+  review_status?: string;
   q?: string;
   page?: number;
   page_size?: number;
@@ -1097,9 +1116,32 @@ export async function patchDetection(
     title: string;
     description: string;
     tags: string[];
+    owner: string;
   }>,
 ): Promise<DetectionDetail> {
   const { data } = await api.patch<DetectionDetail>(`/detections/${id}`, patch);
+  return data;
+}
+
+export type DetectionReviewAction =
+  | 'submit'
+  | 'approve'
+  | 'request_changes'
+  | 'reset';
+
+export async function reviewDetection(
+  id: string,
+  payload: {
+    action: DetectionReviewAction;
+    note?: string;
+    reviewer_email?: string;
+    review_due_at?: string;
+  },
+): Promise<DetectionDetail> {
+  const { data } = await api.post<DetectionDetail>(
+    `/detections/${id}/review`,
+    payload,
+  );
   return data;
 }
 
@@ -1108,6 +1150,7 @@ export async function createDetection(payload: {
   detection_status?: string;
   score_breadth?: number;
   score_depth?: number;
+  owner?: string;
 }): Promise<DetectionDetail> {
   const { data } = await api.post<DetectionDetail>('/detections', payload);
   return data;
@@ -1116,6 +1159,7 @@ export async function createDetection(payload: {
 export interface BulkResult {
   updated: number;
   skipped: number;
+  blocked: number;
 }
 
 export async function bulkDetectionStatus(

@@ -49,6 +49,7 @@ const STATUS_OPTIONS = [
   'not_applicable',
 ];
 import { DetectionDrawerExtras, SuggestionsStrip } from './DetectionExtras';
+import { DetectionReviewPanel } from './ReviewPanel';
 
 const SOURCE_LABELS: Record<string, { label: string; color: 'default' | 'primary' | 'success' | 'warning' }> = {
   global: { label: 'global', color: 'default' },
@@ -63,6 +64,16 @@ const STATUS_LABELS: Record<string, { color: 'default' | 'primary' | 'success' |
   deployed: { color: 'success' },
   gap: { color: 'error' },
   not_applicable: { color: 'default' },
+};
+
+const REVIEW_LABELS: Record<
+  string,
+  { label: string; color: 'default' | 'primary' | 'success' | 'warning' }
+> = {
+  draft: { label: 'Draft', color: 'default' },
+  in_review: { label: 'In review', color: 'primary' },
+  approved: { label: 'Approved', color: 'success' },
+  changes_requested: { label: 'Changes requested', color: 'warning' },
 };
 
 // ---- Sigma YAML syntax highlighting ----------------------------------------
@@ -228,6 +239,7 @@ export default function DetectionsPage() {
   const [status, setStatus] = useState('');
   const [source, setSource] = useState('');
   const [level, setLevel] = useState('');
+  const [reviewStatus, setReviewStatus] = useState('');
   const [techniqueId, setTechniqueId] = useState(searchParams.get('technique_id') ?? '');
 
   const [openId, setOpenId] = useState<string | null>(null);
@@ -258,6 +270,7 @@ export default function DetectionsPage() {
       status: status || undefined,
       source: source || undefined,
       level: level || undefined,
+      review_status: reviewStatus || undefined,
       technique_id: techniqueId || undefined,
     })
       .then((res) => {
@@ -276,7 +289,7 @@ export default function DetectionsPage() {
     return () => {
       cancelled = true;
     };
-  }, [page, q, status, source, level, techniqueId, reloadKey]);
+  }, [page, q, status, source, level, reviewStatus, techniqueId, reloadKey]);
 
   function toggleSelect(id: string) {
     setSelected((s) => {
@@ -298,7 +311,10 @@ export default function DetectionsPage() {
     setBulkMsg(null);
     try {
       const r = await bulkDetectionStatus([...selected], bulkStatus);
-      setBulkMsg(`Updated ${r.updated}${r.skipped ? `, skipped ${r.skipped} global` : ''}.`);
+      const parts = [`Updated ${r.updated}`];
+      if (r.skipped) parts.push(`skipped ${r.skipped} global`);
+      if (r.blocked) parts.push(`${r.blocked} blocked pending approval`);
+      setBulkMsg(`${parts.join(', ')}.`);
       setSelected(new Set());
       setReloadKey((k) => k + 1);
     } catch (e: any) {
@@ -326,11 +342,12 @@ export default function DetectionsPage() {
 
   async function inlineStatus(id: string, newStatus: string) {
     setRowBusy(id);
+    setBulkMsg(null);
     try {
       await patchDetection(id, { detection_status: newStatus });
       setReloadKey((k) => k + 1);
-    } catch {
-      /* surfaced via reload */
+    } catch (e: any) {
+      setBulkMsg(e?.response?.data?.detail ?? 'status update failed');
     } finally {
       setRowBusy(null);
     }
@@ -350,6 +367,7 @@ export default function DetectionsPage() {
     setStatus('');
     setSource('');
     setLevel('');
+    setReviewStatus('');
     setTechniqueId('');
     setPage(1);
   }
@@ -437,6 +455,23 @@ export default function DetectionsPage() {
             </TextField>
             <TextField
               size="small"
+              select
+              label="Review"
+              value={reviewStatus}
+              onChange={(e) => {
+                setPage(1);
+                setReviewStatus(e.target.value);
+              }}
+              sx={{ minWidth: 160 }}
+            >
+              <MenuItem value="">All</MenuItem>
+              <MenuItem value="draft">Draft</MenuItem>
+              <MenuItem value="in_review">In review</MenuItem>
+              <MenuItem value="approved">Approved</MenuItem>
+              <MenuItem value="changes_requested">Changes requested</MenuItem>
+            </TextField>
+            <TextField
+              size="small"
               label="Technique"
               placeholder="e.g. T1059.001"
               value={techniqueId}
@@ -484,6 +519,11 @@ export default function DetectionsPage() {
             >
               Apply
             </Button>
+            {bulkStatus === 'deployed' && (
+              <Typography variant="caption" color="text.secondary">
+                Unapproved rules are skipped.
+              </Typography>
+            )}
             <Button
               variant="outlined"
               size="small"
@@ -524,6 +564,7 @@ export default function DetectionsPage() {
                 <TableCell>Title</TableCell>
                 <TableCell sx={{ width: 110 }}>Source</TableCell>
                 <TableCell sx={{ width: 150 }}>Status</TableCell>
+                <TableCell sx={{ width: 150 }}>Review</TableCell>
                 <TableCell sx={{ width: 90 }}>Level</TableCell>
                 <TableCell>Techniques</TableCell>
               </TableRow>
@@ -531,13 +572,13 @@ export default function DetectionsPage() {
             <TableBody>
               {loading && items.length === 0 ? (
                 <TableRow>
-                  <TableCell colSpan={6} align="center" sx={{ py: 4 }}>
+                  <TableCell colSpan={7} align="center" sx={{ py: 4 }}>
                     <CircularProgress size={20} />
                   </TableCell>
                 </TableRow>
               ) : items.length === 0 ? (
                 <TableRow>
-                  <TableCell colSpan={6} align="center" sx={{ py: 6, color: 'text.secondary' }}>
+                  <TableCell colSpan={7} align="center" sx={{ py: 6, color: 'text.secondary' }}>
                     No detections match these filters.
                   </TableCell>
                 </TableRow>
@@ -589,11 +630,39 @@ export default function DetectionsPage() {
                             onChange={(e) => inlineStatus(d.id, e.target.value)}
                             sx={{ minWidth: 130 }}
                           >
-                            {STATUS_OPTIONS.map((s) => (
-                              <MenuItem key={s} value={s}>{s.replace('_', ' ')}</MenuItem>
-                            ))}
+                            {STATUS_OPTIONS.map((s) => {
+                              const needsApproval =
+                                s === 'deployed' &&
+                                d.review_status !== 'approved' &&
+                                d.detection_status !== 'deployed';
+                              return (
+                                <MenuItem key={s} value={s} disabled={needsApproval}>
+                                  {s.replace('_', ' ')}
+                                  {needsApproval ? ' (approval required)' : ''}
+                                </MenuItem>
+                              );
+                            })}
                           </TextField>
                         )}
+                      </TableCell>
+                      <TableCell>
+                        {(() => {
+                          const status = d.review_status ?? 'draft';
+                          const review = REVIEW_LABELS[status] ?? {
+                            label: status.replace('_', ' '),
+                            color: 'default' as const,
+                          };
+                          const needsReview =
+                            d.detection_status === 'deployed' && status !== 'approved';
+                          return (
+                            <Chip
+                              size="small"
+                              variant={needsReview ? 'filled' : 'outlined'}
+                              label={needsReview ? 'Re-review needed' : review.label}
+                              color={needsReview ? 'warning' : review.color}
+                            />
+                          );
+                        })()}
                       </TableCell>
                       <TableCell>
                         {d.level && (
@@ -686,6 +755,14 @@ export default function DetectionsPage() {
                 {detail.level && <Chip label={detail.level} size="small" />}
                 {detail.sigma_status && <Chip label={detail.sigma_status} size="small" variant="outlined" />}
               </Stack>
+              <DetectionReviewPanel
+                detail={detail}
+                canEdit={canEdit}
+                onChanged={(next) => {
+                  setDetail(next);
+                  setReloadKey((k) => k + 1);
+                }}
+              />
               <Typography variant="body2" color="text.secondary">
                 {detail.description ?? '(no description)'}
               </Typography>

@@ -185,14 +185,15 @@ class TestDetectionsCRUD:
             det_id = r.json()["id"]
             r2 = await c.patch(
                 f"/detections/{det_id}",
-                json={"detection_status": "deployed", "score_breadth": 3},
+                json={"detection_status": "tuning", "score_breadth": 3},
             )
         assert r2.status_code == 200
         body = r2.json()
         assert body["id"] == det_id
-        assert body["detection_status"] == "deployed"
+        assert body["detection_status"] == "tuning"
         assert body["score_breadth"] == 3
         assert body["source"] == "custom"
+        assert body["review_status"] == "draft"
 
     async def test_patch_global_clones_to_customized(
         self, acme_clean, demo_admin_token
@@ -201,15 +202,16 @@ class TestDetectionsCRUD:
         async with _client(demo_admin_token) as c:
             r = await c.patch(
                 f"/detections/{global_id}",
-                json={"detection_status": "deployed", "score_breadth": 5},
+                json={"detection_status": "tuning", "score_breadth": 5},
             )
         assert r.status_code == 200
         body = r.json()
         assert body["id"] != global_id
         assert body["source"] == "customized"
         assert body["upstream_global_id"] == "33333333-3333-3333-3333-333333333333"
-        assert body["detection_status"] == "deployed"
+        assert body["detection_status"] == "tuning"
         assert body["score_breadth"] == 5
+        assert body["review_status"] == "draft"
 
         # Original global row left intact.
         async with _client(demo_admin_token) as c:
@@ -263,3 +265,301 @@ class TestRBAC:
         async with _client(demo_readonly_token) as c:
             r = await c.get("/detections")
         assert r.status_code == 200
+
+    async def test_readonly_cannot_review(
+        self, acme_clean, demo_admin_token, demo_readonly_token
+    ) -> None:
+        async with _client(demo_admin_token) as c:
+            det = await _create(c)
+        async with _client(demo_readonly_token) as c:
+            r = await c.post(
+                f"/detections/{det['id']}/review",
+                json={"action": "submit"},
+            )
+        assert r.status_code == 403
+
+
+async def _create(c, rule: str = SAMPLE_RULE) -> dict:
+    r = await c.post("/detections", json={"raw_yaml": rule})
+    assert r.status_code == 201, r.text
+    return r.json()
+
+
+async def _review(c, detection_id: str, action: str, **payload):
+    return await c.post(
+        f"/detections/{detection_id}/review",
+        json={"action": action, **payload},
+    )
+
+
+class TestDetectionReviewGate:
+    async def test_deploy_requires_approval(
+        self, acme_clean, demo_admin_token
+    ) -> None:
+        async with _client(demo_admin_token) as c:
+            det = await _create(c)
+            assert det["review_status"] == "draft"
+            assert det["owner"] is None
+
+            r = await c.patch(
+                f"/detections/{det['id']}",
+                json={"detection_status": "deployed"},
+            )
+            assert r.status_code == 409
+            assert "Approval required" in r.json()["detail"]
+
+            r = await _review(
+                c,
+                det["id"],
+                "submit",
+                reviewer_email="reviewer@example.com",
+                note="please review",
+            )
+            assert r.status_code == 200
+            body = r.json()
+            assert body["review_status"] == "in_review"
+            assert body["reviewer_email"] == "reviewer@example.com"
+            assert body["review_requested_at"] is not None
+            assert [e["action"] for e in body["review_events"]] == ["submit"]
+
+            r = await c.patch(
+                f"/detections/{det['id']}",
+                json={"detection_status": "deployed"},
+            )
+            assert r.status_code == 409
+
+            r = await _review(c, det["id"], "approve", note="looks good")
+            assert r.status_code == 200
+            body = r.json()
+            assert body["review_status"] == "approved"
+            assert body["reviewed_at"] is not None
+            assert body["review_note"] == "looks good"
+            assert body["reviewer_email"] == "reviewer@example.com"
+            assert body["review_events"][0]["action"] == "approve"
+
+            r = await c.patch(
+                f"/detections/{det['id']}",
+                json={"detection_status": "deployed"},
+            )
+            assert r.status_code == 200
+            assert r.json()["detection_status"] == "deployed"
+
+    async def test_substantive_edit_invalidates_approval(
+        self, acme_clean, demo_admin_token
+    ) -> None:
+        async with _client(demo_admin_token) as c:
+            det = await _create(c)
+            assert (await _review(c, det["id"], "submit")).status_code == 200
+            assert (await _review(c, det["id"], "approve")).status_code == 200
+            r = await c.patch(
+                f"/detections/{det['id']}",
+                json={"detection_status": "deployed"},
+            )
+            assert r.status_code == 200
+
+            r = await c.patch(
+                f"/detections/{det['id']}",
+                json={"score_depth": 4},
+            )
+            assert r.status_code == 200
+            body = r.json()
+            assert body["review_status"] == "draft"
+            assert body["detection_status"] == "deployed"
+            assert body["review_events"][0]["action"] == "invalidated"
+
+            r = await c.patch(
+                f"/detections/{det['id']}",
+                json={"detection_status": "tuning"},
+            )
+            assert r.status_code == 200
+            r = await c.patch(
+                f"/detections/{det['id']}",
+                json={"detection_status": "deployed"},
+            )
+            assert r.status_code == 409
+
+    async def test_edit_and_deploy_in_one_patch_is_rejected(
+        self, acme_clean, demo_admin_token
+    ) -> None:
+        async with _client(demo_admin_token) as c:
+            det = await _create(c)
+            assert (await _review(c, det["id"], "submit")).status_code == 200
+            assert (await _review(c, det["id"], "approve")).status_code == 200
+            r = await c.patch(
+                f"/detections/{det['id']}",
+                json={
+                    "detection_status": "deployed",
+                    "description": "edited at promotion time",
+                },
+            )
+            assert r.status_code == 409
+            assert "substantive edits" in r.json()["detail"]
+
+    async def test_request_changes_and_resubmit(
+        self, acme_clean, demo_admin_token
+    ) -> None:
+        async with _client(demo_admin_token) as c:
+            det = await _create(c)
+            assert (await _review(c, det["id"], "submit")).status_code == 200
+            r = await _review(
+                c,
+                det["id"],
+                "request_changes",
+                note="add a negative test",
+            )
+            assert r.status_code == 200
+            body = r.json()
+            assert body["review_status"] == "changes_requested"
+            assert body["review_note"] == "add a negative test"
+
+            r = await _review(c, det["id"], "submit", note="updated")
+            assert r.status_code == 200
+            body = r.json()
+            assert body["review_status"] == "in_review"
+            assert [e["action"] for e in body["review_events"]] == [
+                "submit",
+                "request_changes",
+                "submit",
+            ]
+
+    async def test_reset_review_clears_assignment(
+        self, acme_clean, demo_admin_token
+    ) -> None:
+        async with _client(demo_admin_token) as c:
+            det = await _create(c)
+            assert (
+                await _review(
+                    c,
+                    det["id"],
+                    "submit",
+                    reviewer_email="reviewer@example.com",
+                    review_due_at="2026-12-01T17:00:00Z",
+                )
+            ).status_code == 200
+            assert (await _review(c, det["id"], "approve")).status_code == 200
+            r = await _review(c, det["id"], "reset")
+            assert r.status_code == 200
+            body = r.json()
+            assert body["review_status"] == "draft"
+            assert body["reviewer_email"] is None
+            assert body["review_requested_at"] is None
+            assert body["reviewed_at"] is None
+            assert body["review_due_at"] is None
+            assert body["review_events"][0]["action"] == "reset"
+
+    async def test_owner_change_does_not_invalidate_approval(
+        self, acme_clean, demo_admin_token
+    ) -> None:
+        async with _client(demo_admin_token) as c:
+            det = await _create(c)
+            assert (await _review(c, det["id"], "submit")).status_code == 200
+            assert (await _review(c, det["id"], "approve")).status_code == 200
+            r = await c.patch(
+                f"/detections/{det['id']}",
+                json={"owner": "soc-owner@example.com"},
+            )
+            assert r.status_code == 200
+            body = r.json()
+            assert body["owner"] == "soc-owner@example.com"
+            assert body["review_status"] == "approved"
+
+    async def test_invalid_review_transition(
+        self, acme_clean, demo_admin_token
+    ) -> None:
+        async with _client(demo_admin_token) as c:
+            det = await _create(c)
+            r = await _review(c, det["id"], "approve")
+            assert r.status_code == 409
+            r = await _review(c, det["id"], "ship_it")
+            assert r.status_code == 422
+
+    async def test_global_rule_cannot_be_reviewed(
+        self, acme_clean, demo_admin_token
+    ) -> None:
+        global_id = await _post_global_row_directly()
+        async with _client(demo_admin_token) as c:
+            r = await _review(c, global_id, "submit")
+        assert r.status_code == 409
+        assert "Customize" in r.json()["detail"]
+
+    async def test_global_customization_must_be_reviewed_before_deploy(
+        self, acme_clean, demo_admin_token
+    ) -> None:
+        global_id = await _post_global_row_directly()
+        async with _client(demo_admin_token) as c:
+            r = await c.patch(
+                f"/detections/{global_id}",
+                json={"detection_status": "deployed"},
+            )
+            assert r.status_code == 409
+
+            r = await c.patch(
+                f"/detections/{global_id}",
+                json={"detection_status": "tuning"},
+            )
+            assert r.status_code == 200
+            cloned = r.json()
+            assert cloned["review_status"] == "draft"
+
+            assert (await _review(c, cloned["id"], "submit")).status_code == 200
+            assert (await _review(c, cloned["id"], "approve")).status_code == 200
+            r = await c.patch(
+                f"/detections/{cloned['id']}",
+                json={"detection_status": "deployed"},
+            )
+            assert r.status_code == 200
+
+    async def test_create_cannot_start_deployed(
+        self, acme_clean, demo_admin_token
+    ) -> None:
+        async with _client(demo_admin_token) as c:
+            r = await c.post(
+                "/detections",
+                json={"raw_yaml": SAMPLE_RULE, "detection_status": "deployed"},
+            )
+        assert r.status_code == 409
+
+    async def test_bulk_status_blocks_unapproved(
+        self, acme_clean, demo_admin_token
+    ) -> None:
+        async with _client(demo_admin_token) as c:
+            approved = await _create(c, SAMPLE_RULE)
+            pending = await _create(c, OTHER_RULE)
+            assert (await _review(c, approved["id"], "submit")).status_code == 200
+            assert (await _review(c, approved["id"], "approve")).status_code == 200
+
+            r = await c.post(
+                "/detections/bulk-status",
+                json={
+                    "ids": [approved["id"], pending["id"]],
+                    "detection_status": "deployed",
+                },
+            )
+            assert r.status_code == 200
+            body = r.json()
+            assert body["updated"] == 1
+            assert body["blocked"] == 1
+            assert body["skipped"] == 0
+
+            r = await c.get(f"/detections/{approved['id']}")
+            assert r.json()["detection_status"] == "deployed"
+            r = await c.get(f"/detections/{pending['id']}")
+            assert r.json()["detection_status"] == "idea"
+
+    async def test_filter_by_review_status(
+        self, acme_clean, demo_admin_token
+    ) -> None:
+        async with _client(demo_admin_token) as c:
+            approved = await _create(c, SAMPLE_RULE)
+            await _create(c, OTHER_RULE)
+            assert (await _review(c, approved["id"], "submit")).status_code == 200
+            assert (await _review(c, approved["id"], "approve")).status_code == 200
+
+            r = await c.get("/detections?review_status=approved")
+            assert r.status_code == 200
+            body = r.json()
+            assert body["total"] == 1
+            assert body["items"][0]["id"] == approved["id"]
+
+            r = await c.get("/detections?review_status=not-a-state")
+            assert r.status_code == 422

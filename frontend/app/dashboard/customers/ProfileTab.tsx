@@ -829,6 +829,8 @@ function DetectionLinkerDialog({
                 upstream_global_id: null,
                 tags: [],
                 techniques: r.techniques,
+                owner: null,
+                review_status: 'draft',
               } as DetectionListItem,
             ]),
           ),

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import uuid
+from datetime import datetime
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
@@ -18,10 +19,24 @@ from app.core.rbac import Permission
 from app.db.tenant import tenant_session
 from app.models.customer import (
     Detection,
+    DetectionReviewEvent,
     DetectionSource,
     DetectionStatus,
     DetectionTechnique,
     SigmaLevel,
+)
+from app.services.detection_review import (
+    DEPLOYMENT_APPROVAL_REQUIRED,
+    DEPLOYMENT_EDIT_REVIEW_REQUIRED,
+    GLOBAL_RULE_REVIEW_REFUSED,
+    GLOBAL_RULE_REVIEW_REQUIRED,
+    ReviewTransitionError,
+    apply_review_action,
+    deployment_block_reason,
+    invalidate_review,
+    parse_review_action,
+    parse_review_status,
+    review_status_value,
 )
 from app.services.sigma_validate import (
     SigmaValidationError,
@@ -50,6 +65,18 @@ class DetectionListItem(BaseModel):
     upstream_global_id: Optional[str]
     tags: list[str]
     techniques: list[str]
+    owner: Optional[str]
+    review_status: str
+
+
+class DetectionReviewEventOut(BaseModel):
+    id: str
+    action: str
+    from_status: str
+    to_status: str
+    note: Optional[str]
+    actor_email: Optional[str]
+    created_at: datetime
 
 
 class DetectionDetail(DetectionListItem):
@@ -60,6 +87,12 @@ class DetectionDetail(DetectionListItem):
     detection: dict
     falsepositives: list[str]
     raw_yaml: Optional[str]
+    reviewer_email: Optional[str]
+    review_requested_at: Optional[datetime]
+    reviewed_at: Optional[datetime]
+    review_due_at: Optional[datetime]
+    review_note: Optional[str]
+    review_events: list[DetectionReviewEventOut]
 
 
 class PaginatedDetections(BaseModel):
@@ -74,6 +107,7 @@ class DetectionCreate(BaseModel):
     detection_status: Optional[str] = None
     score_breadth: int = 0
     score_depth: int = 0
+    owner: Optional[str] = None
 
 
 class DetectionPatch(BaseModel):
@@ -85,6 +119,14 @@ class DetectionPatch(BaseModel):
     score_breadth: Optional[int] = None
     score_depth: Optional[int] = None
     tags: Optional[list[str]] = None
+    owner: Optional[str] = None
+
+
+class ReviewActionIn(BaseModel):
+    action: str
+    note: Optional[str] = None
+    reviewer_email: Optional[str] = None
+    review_due_at: Optional[datetime] = None
 
 
 def _validate_status(s: Optional[str]) -> Optional[DetectionStatus]:
@@ -105,6 +147,22 @@ def _validate_level(s: Optional[str]) -> Optional[SigmaLevel]:
         raise HTTPException(422, f"invalid level: {s!r}") from e
 
 
+def _validate_review_status(s: Optional[str]) -> Optional[str]:
+    if s is None:
+        return None
+    try:
+        return parse_review_status(s).value
+    except ValueError as e:
+        raise HTTPException(422, str(e)) from e
+
+
+def _validate_review_action(s: str):
+    try:
+        return parse_review_action(s)
+    except ValueError as e:
+        raise HTTPException(422, str(e)) from e
+
+
 def _serialize_list_item(d: Detection, technique_ids: list[str]) -> DetectionListItem:
     return DetectionListItem(
         id=str(d.id),
@@ -119,10 +177,28 @@ def _serialize_list_item(d: Detection, technique_ids: list[str]) -> DetectionLis
         upstream_global_id=d.upstream_global_id,
         tags=list(d.tags or []),
         techniques=technique_ids,
+        owner=d.owner,
+        review_status=review_status_value(d.review_status),
     )
 
 
-def _serialize_detail(d: Detection, technique_ids: list[str]) -> DetectionDetail:
+def _serialize_review_event(event: DetectionReviewEvent) -> DetectionReviewEventOut:
+    return DetectionReviewEventOut(
+        id=str(event.id),
+        action=event.action,
+        from_status=event.from_status,
+        to_status=event.to_status,
+        note=event.note,
+        actor_email=event.actor_email,
+        created_at=event.created_at,
+    )
+
+
+def _serialize_detail(
+    d: Detection,
+    technique_ids: list[str],
+    review_events: Optional[list[DetectionReviewEvent]] = None,
+) -> DetectionDetail:
     base = _serialize_list_item(d, technique_ids)
     return DetectionDetail(
         **base.model_dump(),
@@ -133,7 +209,27 @@ def _serialize_detail(d: Detection, technique_ids: list[str]) -> DetectionDetail
         detection=dict(d.detection or {}),
         falsepositives=list(d.falsepositives or []),
         raw_yaml=d.raw_yaml,
+        reviewer_email=d.reviewer_email,
+        review_requested_at=d.review_requested_at,
+        reviewed_at=d.reviewed_at,
+        review_due_at=d.review_due_at,
+        review_note=d.review_note,
+        review_events=[_serialize_review_event(e) for e in (review_events or [])],
     )
+
+
+async def _review_events_for(
+    session, detection_id: uuid.UUID, limit: int = 50
+) -> list[DetectionReviewEvent]:
+    rows = (
+        await session.execute(
+            select(DetectionReviewEvent)
+            .where(DetectionReviewEvent.detection_id == detection_id)
+            .order_by(DetectionReviewEvent.created_at.desc())
+            .limit(limit)
+        )
+    ).scalars().all()
+    return list(rows)
 
 
 async def _techniques_for(session, detection_ids: list[uuid.UUID]) -> dict[uuid.UUID, list[str]]:
@@ -183,6 +279,7 @@ async def list_detections(
     source: Optional[str] = Query(None),
     technique_id: Optional[str] = Query(None),
     level: Optional[str] = Query(None),
+    review_status: Optional[str] = Query(None),
     q: Optional[str] = Query(None, description="ILIKE on title"),
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=200),
@@ -199,6 +296,8 @@ async def list_detections(
             raise HTTPException(422, f"invalid source: {source!r}") from e
     if level:
         clauses.append(Detection.level == _validate_level(level))
+    if review_status:
+        clauses.append(Detection.review_status == _validate_review_status(review_status))
     if q:
         clauses.append(Detection.title.ilike(f"%{q}%"))
 
@@ -257,7 +356,8 @@ async def get_detection(
         if row is None:
             raise HTTPException(404, "detection not found")
         tech_map = await _techniques_for(session, [row.id])
-    return _serialize_detail(row, tech_map.get(row.id, []))
+        events = await _review_events_for(session, row.id)
+    return _serialize_detail(row, tech_map.get(row.id, []), events)
 
 
 @router.post("", response_model=DetectionDetail, status_code=201)
@@ -272,6 +372,8 @@ async def create_detection(
     except SigmaValidationError as e:
         raise HTTPException(422, str(e)) from e
     status = _validate_status(payload.detection_status) or DetectionStatus.IDEA
+    if status == DetectionStatus.DEPLOYED:
+        raise HTTPException(409, DEPLOYMENT_APPROVAL_REQUIRED)
     level = SigmaLevel(parsed["level"]) if parsed.get("level") in SigmaLevel._value2member_map_ else None
 
     async with tenant_session() as session:
@@ -303,12 +405,35 @@ async def create_detection(
             source=DetectionSource.CUSTOM,
             score_breadth=payload.score_breadth,
             score_depth=payload.score_depth,
+            owner=payload.owner or None,
+            review_status="draft",
         )
         session.add(det)
         await session.flush()
         await _replace_technique_mappings(session, det.id, parsed["tags"])
         tech_map = await _techniques_for(session, [det.id])
     return _serialize_detail(det, tech_map.get(det.id, []))
+
+
+def _has_substantive_changes(payload: DetectionPatch) -> bool:
+    """True when the patch changes the rule's behavior or presentation.
+
+    Owner changes are deliberately excluded: reassigning a rule does not
+    invalidate a review. Status-only changes are also excluded; the gate
+    handles promotion separately.
+    """
+    return any(
+        value is not None
+        for value in (
+            payload.raw_yaml,
+            payload.title,
+            payload.description,
+            payload.tags,
+            payload.level,
+            payload.score_breadth,
+            payload.score_depth,
+        )
+    )
 
 
 @router.patch("/{detection_id:uuid}", response_model=DetectionDetail)
@@ -323,6 +448,10 @@ async def patch_detection(
        - source=global   → clone to a new row with source=customized
                            (preserves upstream link). Original is untouched.
        - source=custom/customized → mutate in place.
+
+    A transition into `deployed` requires an approved review. A patch that
+    both edits the rule and promotes it is rejected: the edit invalidates the
+    approval it would otherwise rely on.
     """
     async with tenant_session() as session:
         row = (
@@ -340,7 +469,16 @@ async def patch_detection(
             except SigmaValidationError as e:
                 raise HTTPException(422, str(e)) from e
 
+        new_status = _validate_status(payload.detection_status)
+        substantive = _has_substantive_changes(payload)
+
         if row.source == DetectionSource.GLOBAL:
+            # Customizing a global rule creates a new customer-owned rule, so
+            # it starts a fresh review. An explicit request to deploy that new
+            # rule is always blocked until it has been reviewed.
+            if new_status == DetectionStatus.DEPLOYED:
+                raise HTTPException(409, GLOBAL_RULE_REVIEW_REQUIRED)
+
             upstream_id = row.upstream_global_id or row.sigma_id
             target = Detection(
                 id=uuid.uuid4(),
@@ -364,16 +502,32 @@ async def patch_detection(
                 detection=parsed["detection"] if parsed else dict(row.detection or {}),
                 falsepositives=parsed["falsepositives"] if parsed else list(row.falsepositives or []),
                 raw_yaml=parsed["raw_yaml"] if parsed else row.raw_yaml,
-                detection_status=_validate_status(payload.detection_status) or row.detection_status,
+                detection_status=new_status or row.detection_status,
                 source=DetectionSource.CUSTOMIZED,
                 score_breadth=payload.score_breadth if payload.score_breadth is not None else row.score_breadth,
                 score_depth=payload.score_depth if payload.score_depth is not None else row.score_depth,
                 upstream_global_id=upstream_id,
+                owner=(
+                    (payload.owner or None)
+                    if payload.owner is not None
+                    else row.owner
+                ),
+                review_status="draft",
             )
             session.add(target)
             await session.flush()
             await _replace_technique_mappings(session, target.id, target.tags)
         else:
+            if (
+                new_status == DetectionStatus.DEPLOYED
+                and row.detection_status != DetectionStatus.DEPLOYED
+            ):
+                if substantive:
+                    raise HTTPException(409, DEPLOYMENT_EDIT_REVIEW_REQUIRED)
+                reason = deployment_block_reason(row)
+                if reason:
+                    raise HTTPException(409, reason)
+
             if parsed is not None:
                 row.title = parsed["title"]
                 row.description = parsed["description"]
@@ -392,19 +546,75 @@ async def patch_detection(
                     row.description = payload.description
                 if payload.tags is not None:
                     row.tags = payload.tags
-            if payload.detection_status is not None:
-                row.detection_status = _validate_status(payload.detection_status)
+            if new_status is not None:
+                row.detection_status = new_status
             if payload.level is not None:
                 row.level = _validate_level(payload.level)
             if payload.score_breadth is not None:
                 row.score_breadth = payload.score_breadth
             if payload.score_depth is not None:
                 row.score_depth = payload.score_depth
+            if payload.owner is not None:
+                row.owner = payload.owner or None
+
+            if substantive:
+                event = invalidate_review(
+                    row,
+                    actor_email=_principal.user.email,
+                    reason="Detection content changed; review must be repeated.",
+                )
+                if event is not None:
+                    session.add(event)
+
             await _replace_technique_mappings(session, row.id, list(row.tags or []))
             target = row
         await session.flush()
         tech_map = await _techniques_for(session, [target.id])
-    return _serialize_detail(target, tech_map.get(target.id, []))
+        events = await _review_events_for(session, target.id)
+    return _serialize_detail(target, tech_map.get(target.id, []), events)
+
+
+@router.post("/{detection_id:uuid}/review", response_model=DetectionDetail)
+async def review_detection(
+    detection_id: uuid.UUID,
+    payload: ReviewActionIn,
+    _principal: TenantPrincipal = Depends(require_perm(Permission.DETECTION_WRITE)),
+    __: TenantPrincipal = Depends(require_active_customer()),
+    ___: TenantPrincipal = Depends(require_feature("detection_editing")),
+) -> DetectionDetail:
+    """Move a detection through its review lifecycle.
+
+    Approval is recorded separately from `detection_status`; the caller still
+    has to patch the status to `deployed` (or approve first, then deploy).
+    """
+    action = _validate_review_action(payload.action)
+    async with tenant_session() as session:
+        row = (
+            await session.execute(
+                select(Detection).where(Detection.id == detection_id)
+            )
+        ).scalar_one_or_none()
+        if row is None:
+            raise HTTPException(404, "detection not found")
+        if row.source == DetectionSource.GLOBAL:
+            raise HTTPException(409, GLOBAL_RULE_REVIEW_REFUSED)
+
+        try:
+            event = apply_review_action(
+                row,
+                action,
+                actor_email=_principal.user.email,
+                note=payload.note,
+                reviewer_email=payload.reviewer_email,
+                due_at=payload.review_due_at,
+            )
+        except ReviewTransitionError as e:
+            raise HTTPException(409, str(e)) from e
+        session.add(event)
+        await session.flush()
+        tech_map = await _techniques_for(session, [row.id])
+        events = await _review_events_for(session, row.id)
+    return _serialize_detail(row, tech_map.get(row.id, []), events)
 
 
 @router.delete("/{detection_id:uuid}", status_code=204)
@@ -437,6 +647,7 @@ class BulkStatusIn(BaseModel):
 class BulkResultOut(BaseModel):
     updated: int
     skipped: int
+    blocked: int = 0
 
 
 @router.post("/bulk-status", response_model=BulkResultOut)
@@ -453,7 +664,7 @@ async def bulk_status(
         raise HTTPException(422, "invalid detection_status")
     if not payload.ids:
         return BulkResultOut(updated=0, skipped=0)
-    updated = skipped = 0
+    updated = skipped = blocked = 0
     async with tenant_session() as session:
         rows = (
             await session.execute(select(Detection).where(Detection.id.in_(payload.ids)))
@@ -462,9 +673,17 @@ async def bulk_status(
             if row.source == DetectionSource.GLOBAL:
                 skipped += 1
                 continue
+            if (
+                new_status == DetectionStatus.DEPLOYED
+                and row.detection_status != DetectionStatus.DEPLOYED
+                and review_status_value(row.review_status)
+                != "approved"
+            ):
+                blocked += 1
+                continue
             row.detection_status = new_status
             updated += 1
-    return BulkResultOut(updated=updated, skipped=skipped)
+    return BulkResultOut(updated=updated, skipped=skipped, blocked=blocked)
 
 
 class BulkDeleteIn(BaseModel):

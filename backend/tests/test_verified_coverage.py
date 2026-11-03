@@ -264,6 +264,21 @@ class TestEvidenceLadder:
         assert evidence.deployed_matches[0].connector == "Sentinel"
         assert "Required telemetry is not collected" in evidence.blockers
 
+    def test_deployed_without_review_approval_is_called_out(self) -> None:
+        detection = _detection(
+            detection_status=SimpleNamespace(value="deployed"),
+            review_status="draft",
+        )
+        deployment = _deployment(external_id="0f0d6a5e-1111-2222-3333-444455556666")
+        evidence = _evidence(
+            detection=detection,
+            samples=[_sample(True)],
+            deployments=[deployment],
+        )
+        assert evidence.level == 4
+        assert "Deployed without an approved review" in evidence.blockers
+        assert "review" in evidence.next_action.lower()
+
     def test_collected_telemetry_moves_to_effective(self) -> None:
         deployment = _deployment(external_id="0f0d6a5e-1111-2222-3333-444455556666")
         visibility = {

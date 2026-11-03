@@ -53,6 +53,19 @@ class SigmaLevel(str, enum.Enum):
     CRITICAL = "critical"
 
 
+class DetectionReviewStatus(str, enum.Enum):
+    """Editorial state that gates promotion to `deployed`.
+
+    The lifecycle is deliberately separate from `DetectionStatus`: a rule can
+    be deployed in production and still need re-review after an edit, so
+    status and review state are not the same axis.
+    """
+    DRAFT = "draft"
+    IN_REVIEW = "in_review"
+    APPROVED = "approved"
+    CHANGES_REQUESTED = "changes_requested"
+
+
 class Detection(CustomerBase):
     """A Sigma rule + operational overlay (status, scoring, source provenance).
 
@@ -101,6 +114,26 @@ class Detection(CustomerBase):
     # Origin tracking for global-rule overrides (lets us reset to upstream).
     upstream_global_id: Mapped[Optional[str]] = mapped_column(String(64), index=True)
 
+    # --- Review lifecycle ---
+    # `review_status` gates transitions into DetectionStatus.DEPLOYED. The
+    # remaining columns are the current review assignment/decision. The full
+    # history lives in DetectionReviewEvent so a rule can be audited after
+    # several review cycles without replaying the detection row.
+    owner: Mapped[Optional[str]] = mapped_column(String(200))
+    review_status: Mapped[str] = mapped_column(
+        String(20),
+        default=DetectionReviewStatus.DRAFT.value,
+        nullable=False,
+        index=True,
+    )
+    reviewer_email: Mapped[Optional[str]] = mapped_column(String(320))
+    review_requested_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True)
+    )
+    reviewed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    review_due_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    review_note: Mapped[Optional[str]] = mapped_column(Text)
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
@@ -140,6 +173,33 @@ class DetectionTechnique(CustomerBase):
     domain: Mapped[str] = mapped_column(String(20), nullable=False, default="enterprise")
 
     detection: Mapped[Detection] = relationship(back_populates="technique_mappings")
+
+
+class DetectionReviewEvent(CustomerBase):
+    """Append-only audit trail for the detection review lifecycle.
+
+    Kept separate from the detection row so a rule that cycles through
+    draft -> in review -> changes requested -> in review -> approved keeps
+    every decision and note. `action` is string-validated by the service,
+    matching the forward-compatible pattern used by the CMF tables.
+    """
+    __tablename__ = "detection_review_events"
+
+    id: Mapped[uuid.UUID] = uuid_pk()
+    detection_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("detections.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    action: Mapped[str] = mapped_column(String(32), nullable=False)
+    from_status: Mapped[str] = mapped_column(String(20), nullable=False)
+    to_status: Mapped[str] = mapped_column(String(20), nullable=False)
+    note: Mapped[Optional[str]] = mapped_column(Text)
+    actor_email: Mapped[Optional[str]] = mapped_column(String(320))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
 
 
 class Connector(CustomerBase):

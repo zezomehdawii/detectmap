@@ -206,6 +206,8 @@ def _telemetry_for(
 
 
 def _next_action(level: int, status: str, blockers: list[str]) -> str:
+    if any("approved review" in b for b in blockers):
+        return "Complete the detection review or roll back the deployment"
     if level >= 6:
         return "Keep validating on a schedule"
     if level == 1:
@@ -312,6 +314,12 @@ def _build_detection_evidence(
             blockers.append("Marked deployed, but no enabled matching SIEM rule was found")
         else:
             blockers.append("No enabled matching SIEM rule")
+
+    review_status = getattr(detection, "review_status", None)
+    if hasattr(review_status, "value"):
+        review_status = review_status.value
+    if status == "deployed" and review_status not in (None, "approved"):
+        blockers.append("Deployed without an approved review")
 
     if level >= 4:
         if telemetry_state in {state.value for state in _TELEMETRY_READY_STATES}:
