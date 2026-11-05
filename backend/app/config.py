@@ -20,6 +20,12 @@ class Settings(BaseSettings):
     app_name: str = "The Detection Map"
     cors_origins: str = "http://localhost:3000"
 
+    # Sign-in page hint for fresh/demo installations. The credentials are
+    # only returned by /auth/login-hint while an administrator leaves the
+    # hint enabled in Settings; they are never written to the database.
+    default_login_email: str = "admin@demo.local"
+    default_login_password: str = "change-me"
+
     # DB
     database_url: str
     database_url_sync: str

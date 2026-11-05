@@ -49,6 +49,7 @@ import {
   LdapConfig,
   MailConfig,
   MSSPBranding,
+  LoginHint,
   PermissionMeta,
   SettingsUserOut,
   createCustomRole,
@@ -58,6 +59,7 @@ import {
   getAIConfig,
   getCatalogSchedule,
   getLdapConfig,
+  getLoginHintSettings,
   getMailConfig,
   getMSSPBranding,
   listAttackDiffs,
@@ -69,6 +71,7 @@ import {
   patchAIConfig,
   patchCatalogSchedule,
   patchLdapConfig,
+  patchLoginHintSettings,
   patchMailConfig,
   patchMSSPBranding,
   refreshD3FENDCatalog,
@@ -185,56 +188,140 @@ function BrandingTab() {
   }
 
   return (
+    <Stack spacing={2}>
+      <Card>
+        <CardContent>
+          <Typography
+            variant="overline"
+            sx={{ fontWeight: 700, color: 'text.secondary' }}
+          >
+            MSSP branding ({data?.mssp_org_name ?? '—'})
+          </Typography>
+          {error && (
+            <Typography color="error" sx={{ mt: 1 }}>
+              {error}
+            </Typography>
+          )}
+          <Stack spacing={2} sx={{ mt: 2 }}>
+            <TextField
+              size="small"
+              label="Display name"
+              value={displayName}
+              onChange={(e) => setDisplayName(e.target.value)}
+              helperText="Used in report titles and the dashboard header."
+            />
+            <TextField
+              size="small"
+              label="Logo URL"
+              value={logoUrl}
+              onChange={(e) => setLogoUrl(e.target.value)}
+              helperText="Optional. Embedded in branded PDF exports (planned)."
+            />
+            <TextField
+              size="small"
+              label="Primary colour"
+              value={primaryColor}
+              onChange={(e) => setPrimaryColor(e.target.value)}
+              placeholder="#4f46e5"
+            />
+            <Box>
+              <Button
+                variant="contained"
+                startIcon={busy ? <CircularProgress size={14} /> : <SaveRoundedIcon />}
+                onClick={save}
+                disabled={busy}
+              >
+                Save branding
+              </Button>
+              {saved && (
+                <Typography variant="caption" color="text.secondary" sx={{ ml: 2 }}>
+                  Saved.
+                </Typography>
+              )}
+            </Box>
+          </Stack>
+        </CardContent>
+      </Card>
+      <LoginHintCard />
+    </Stack>
+  );
+}
+
+function LoginHintCard() {
+  const [hint, setHint] = useState<LoginHint | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const reload = useCallback(async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      setHint(await getLoginHintSettings());
+    } catch (e: any) {
+      setError(e?.response?.data?.detail ?? 'failed to load sign-in hint');
+    } finally {
+      setBusy(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    reload();
+  }, [reload]);
+
+  async function toggle(enabled: boolean) {
+    setBusy(true);
+    setError(null);
+    try {
+      setHint(await patchLoginHintSettings(enabled));
+    } catch (e: any) {
+      setError(e?.response?.data?.detail ?? 'save failed');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
     <Card>
       <CardContent>
         <Typography
           variant="overline"
           sx={{ fontWeight: 700, color: 'text.secondary' }}
         >
-          MSSP branding ({data?.mssp_org_name ?? '—'})
+          Sign-in page
+        </Typography>
+        <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>
+          Show the configured default credentials on the login card so testers
+          can sign in. Turn this off once the bootstrap password has been
+          rotated.
         </Typography>
         {error && (
           <Typography color="error" sx={{ mt: 1 }}>
             {error}
           </Typography>
         )}
-        <Stack spacing={2} sx={{ mt: 2 }}>
-          <TextField
-            size="small"
-            label="Display name"
-            value={displayName}
-            onChange={(e) => setDisplayName(e.target.value)}
-            helperText="Used in report titles and the dashboard header."
+        <Stack spacing={1} sx={{ mt: 2 }}>
+          <FormControlLabel
+            control={
+              <Switch
+                checked={Boolean(hint?.enabled)}
+                onChange={(e) => toggle(e.target.checked)}
+                disabled={busy || !hint}
+              />
+            }
+            label="Show default credentials on the sign-in page"
           />
-          <TextField
-            size="small"
-            label="Logo URL"
-            value={logoUrl}
-            onChange={(e) => setLogoUrl(e.target.value)}
-            helperText="Optional. Embedded in branded PDF exports (planned)."
-          />
-          <TextField
-            size="small"
-            label="Primary colour"
-            value={primaryColor}
-            onChange={(e) => setPrimaryColor(e.target.value)}
-            placeholder="#4f46e5"
-          />
-          <Box>
-            <Button
-              variant="contained"
-              startIcon={busy ? <CircularProgress size={14} /> : <SaveRoundedIcon />}
-              onClick={save}
-              disabled={busy}
-            >
-              Save branding
-            </Button>
-            {saved && (
-              <Typography variant="caption" color="text.secondary" sx={{ ml: 2 }}>
-                Saved.
-              </Typography>
-            )}
-          </Box>
+          {busy && !hint && <CircularProgress size={20} />}
+          {hint?.enabled && hint.email && (
+            <Typography variant="body2" color="text.secondary">
+              Displayed: <Box component="code">{hint.email}</Box>
+              {hint.password ? (
+                <>
+                  {' / '}
+                  <Box component="code">{hint.password}</Box>
+                </>
+              ) : null}
+            </Typography>
+          )}
         </Stack>
       </CardContent>
     </Card>

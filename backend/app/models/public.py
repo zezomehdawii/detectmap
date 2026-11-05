@@ -585,6 +585,11 @@ class AppSettings(PublicBase):
     snapshot_refresh_enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     legend_overrides: Mapped[dict] = mapped_column(JSONB, default=dict, nullable=False)
 
+    # Show the configured default login credentials on the sign-in page.
+    # Product-wide because the login screen has no tenant context; an MSSP
+    # admin can switch it off once the bootstrap password has been rotated.
+    show_login_hint: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+
     # --- LDAP / Active Directory authentication (instance-wide) ---
     # When enabled, /auth/login falls through to an LDAP bind after local
     # auth fails, JIT-provisioning the user at `ldap_default_role`.

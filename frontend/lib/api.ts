@@ -2124,6 +2124,31 @@ export interface MSSPBranding {
   branding: Record<string, unknown>;
 }
 
+export interface LoginHint {
+  enabled: boolean;
+  email: string | null;
+  password: string | null;
+}
+
+export async function getLoginHint(): Promise<LoginHint> {
+  const { data } = await api.get<LoginHint>('/auth/login-hint');
+  return data;
+}
+
+export async function getLoginHintSettings(): Promise<LoginHint> {
+  const { data } = await api.get<LoginHint>('/settings/login-hint');
+  return data;
+}
+
+export async function patchLoginHintSettings(
+  enabled: boolean,
+): Promise<LoginHint> {
+  const { data } = await api.patch<LoginHint>('/settings/login-hint', {
+    enabled,
+  });
+  return data;
+}
+
 export interface CustomerBranding {
   customer_id: string;
   codename: string;

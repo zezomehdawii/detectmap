@@ -1,17 +1,18 @@
 'use client';
 
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import {
   Alert,
   Box,
   Button,
   CircularProgress,
+  Paper,
   Stack,
   TextField,
   Typography,
 } from '@mui/material';
-import { login, fetchMe, clearApiCache } from '@/lib/api';
+import { login, fetchMe, clearApiCache, getLoginHint, LoginHint } from '@/lib/api';
 import { setToken, setActiveCustomer } from '@/lib/auth';
 import { gradients } from '../theme';
 
@@ -21,6 +22,31 @@ export default function LoginPage() {
   const [password, setPassword] = useState('');
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [hint, setHint] = useState<LoginHint | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    // Non-fatal: if the hint is unavailable the card still works normally.
+    getLoginHint()
+      .then((h) => {
+        if (!cancelled) setHint(h);
+      })
+      .catch(() => {
+        /* ignore — the hint is a convenience, not a requirement */
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const showHint = Boolean(hint?.enabled && hint.email && hint.password);
+
+  function useHint() {
+    if (!hint?.email || !hint?.password) return;
+    setEmail(hint.email);
+    setPassword(hint.password);
+    setError(null);
+  }
 
   async function handleSubmit() {
     setError(null);
@@ -145,6 +171,40 @@ export default function LoginPage() {
           >
             {busy ? <CircularProgress size={22} color="inherit" /> : 'Sign in'}
           </Button>
+
+          {showHint && hint && (
+            <Paper
+              variant="outlined"
+              sx={(t) => ({
+                p: 2,
+                borderRadius: 2,
+                bgcolor: 'action.hover',
+                ...t.applyStyles('dark', {
+                  bgcolor: 'rgba(255,255,255,0.03)',
+                }),
+              })}
+            >
+              <Stack spacing={0.5}>
+                <Typography
+                  variant="overline"
+                  sx={{ fontWeight: 700, color: 'text.secondary' }}
+                >
+                  Default credentials
+                </Typography>
+                <Typography variant="body2" color="text.secondary">
+                  Email: <Box component="code">{hint.email}</Box>
+                </Typography>
+                <Typography variant="body2" color="text.secondary">
+                  Password: <Box component="code">{hint.password}</Box>
+                </Typography>
+                <Box sx={{ pt: 0.5 }}>
+                  <Button size="small" onClick={useHint} disabled={busy}>
+                    Use these credentials
+                  </Button>
+                </Box>
+              </Stack>
+            </Paper>
+          )}
         </Stack>
       </Box>
     </Box>

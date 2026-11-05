@@ -22,6 +22,7 @@ from app.api.deps import (
     require_active_customer,
     require_perm,
 )
+from app.config import settings as app_config
 from app.core.rbac import Permission
 from app.core.security import hash_password
 from app.db.base import AsyncSessionLocal
@@ -304,6 +305,59 @@ async def _get_or_create_settings(session) -> AppSettings:
         session.add(row)
         await session.flush()
     return row
+
+
+# ---- Sign-in page hint ---------------------------------------------------
+
+class LoginHintSettingsOut(BaseModel):
+    enabled: bool
+    email: Optional[str]
+    password: Optional[str]
+
+
+class LoginHintSettingsPatch(BaseModel):
+    enabled: bool
+
+
+def _login_hint_settings_out(row: AppSettings) -> LoginHintSettingsOut:
+    return LoginHintSettingsOut(
+        enabled=row.show_login_hint,
+        email=(app_config.default_login_email or "").strip() or None,
+        password=app_config.default_login_password or None,
+    )
+
+
+@router.get("/login-hint", response_model=LoginHintSettingsOut)
+async def get_login_hint_settings(
+    _: TenantPrincipal = Depends(require_perm(Permission.CUSTOMER_READ)),
+) -> LoginHintSettingsOut:
+    """Current state of the sign-in credential hint."""
+    async with AsyncSessionLocal() as session:
+        row = await _get_or_create_settings(session)
+        return _login_hint_settings_out(row)
+
+
+@router.patch("/login-hint", response_model=LoginHintSettingsOut)
+async def patch_login_hint_settings(
+    payload: LoginHintSettingsPatch = Body(...),
+    principal: TenantPrincipal = Depends(
+        require_perm(Permission.CUSTOMER_PROVISION)
+    ),
+) -> LoginHintSettingsOut:
+    """Show or hide the default credentials on the sign-in page."""
+    async with AsyncSessionLocal() as session:
+        row = await _get_or_create_settings(session)
+        row.show_login_hint = payload.enabled
+        await _record_audit(
+            session,
+            actor_email=principal.user.email,
+            actor_kind="user",
+            action="login_hint.update",
+            detail=f"enabled={payload.enabled}",
+        )
+        await session.commit()
+        await session.refresh(row)
+        return _login_hint_settings_out(row)
 
 
 async def _latest_runs(session) -> dict[str, "ScheduledJobRunOut"]:

@@ -15,6 +15,7 @@ from pydantic import BaseModel
 from sqlalchemy import select
 
 from app.api.deps import TenantPrincipal, current_tenant_user
+from app.config import settings
 from app.core.security import (
     TokenAudience,
     create_access_token,
@@ -130,6 +131,37 @@ class MeResponse(BaseModel):
     customer_name: str | None
     mssp_org_id: str | None
     must_change_password: bool = False
+
+
+class LoginHintOut(BaseModel):
+    """Public sign-in hint.
+
+    Credentials are omitted entirely when an administrator has hidden the
+    hint, so the response never leaks them by accident.
+    """
+    enabled: bool
+    email: str | None = None
+    password: str | None = None
+
+
+@router.get("/login-hint", response_model=LoginHintOut)
+async def login_hint() -> LoginHintOut:
+    """Default credentials for the sign-in card, if the admin allows it.
+
+    The values come from configuration (never the database). This is meant
+    for fresh/demo installations; rotate the bootstrap password and switch
+    the hint off in Settings before exposing the instance publicly.
+    """
+    async with AsyncSessionLocal() as session:
+        row = (await session.execute(select(AppSettings))).scalar_one_or_none()
+    if row is not None and not row.show_login_hint:
+        return LoginHintOut(enabled=False)
+
+    email = (settings.default_login_email or "").strip()
+    password = settings.default_login_password or ""
+    if not email or not password:
+        return LoginHintOut(enabled=False)
+    return LoginHintOut(enabled=True, email=email, password=password)
 
 
 @router.post("/login", response_model=TokenResponse)
