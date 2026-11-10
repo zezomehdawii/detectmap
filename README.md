@@ -71,22 +71,63 @@ sits on top of them.
 
 ### Recommended: interactive installer
 
+Install **Python 3.10+** first, then run this command from the repository root:
+
 ```bash
 python3 setup.py
 ```
 
-The installer walks the operator through:
+The wizard checks dependencies before changing application configuration. It
+shows each proposed installation/start command and asks before running it.
+An internet connection is needed to download packages and container images.
 
-1. **Hostname / IP** (used for both CORS allow-list and the frontend's API base URL).
-2. **Listen port.** For HTTP mode, choose **3000** to match the base Compose mapping. TLS mode uses the selected port through its overlay.
-3. **TLS mode** — *none* (HTTP), *self-signed* (generated on the fly via `cryptography`), or *bring-your-own certificate* (drop `cert.pem` + `key.pem` into `./tls/`).
-4. **Generates `.env`** with strong secrets (`JWT_TENANT_SECRET`, `JWT_SUPERADMIN_SECRET`, `FERNET_KEY`, `INTERNAL_API_KEY`).
-5. **Brings the stack up** with `docker compose up --build -d`, layering in `docker-compose.tls.yml` (Caddy reverse proxy) when TLS is selected.
-6. **Factory-resets** to a single-admin clean slate. A random initial password is generated, printed to the terminal **once**, and `must_change_password=True` is set — the admin is forced through `/change-password` on first login.
+| Host | Missing Docker / Compose installation |
+|---|---|
+| Windows | Offers Docker Desktop through `winget` when available. |
+| macOS | Offers Docker Desktop through Homebrew when available. |
+| Ubuntu / Debian | Offers Docker Engine, CLI, Buildx and Compose from Docker's signed apt repository. |
+| Other systems / no supported package manager | Shows the official installation guide and how to resume setup. |
 
-For an existing deployment, use `python3 setup.py --keep-env --skip-reset`
-to retain both the existing environment/keys and data. `--skip-reset` alone
-still regenerates `.env`. Use `--reset` only for an intentional factory reset.
+Docker Desktop first-start setup, license prompts, virtualization/WSL setup,
+administrator approval, and any requested restart remain with the operator.
+After completing them, rerun the same command. The wizard checks again and
+reuses installed dependencies. It can offer to start an installed Docker
+service/Desktop and wait for Linux containers to become ready.
+
+Node.js, PostgreSQL, Redis, the backend Python dependencies, and frontend npm
+dependencies are installed **inside Docker**. Self-signed TLS generation also
+uses the backend container, so setup does not install packages into system
+Python. Python itself must already be available to run the installer.
+
+The configuration prompts provide suggested values; press **Enter** to accept:
+
+1. **Hostname/IP:** a detected LAN IPv4 address; the detected hostname is also shown.
+2. **Transport:** HTTP, HTTPS with a generated certificate, or HTTPS with your certificate.
+3. **Listen port:** HTTP defaults to **8080**, HTTPS to **8443**. The chosen port drives the actual frontend/proxy mapping.
+4. **Administrator identities:** `admin@detectmap.local` and `super@detectmap.local`.
+
+Setup builds and starts the stack, waits for the API, and initializes the two
+administrators **only when the deployment is empty**. Random temporary
+passwords are printed once, after commit, and must be changed on first login.
+Existing deployments, accounts, and customer data remain unchanged.
+
+An existing `.env` is kept by default. Choosing to reconfigure updates only
+network settings, retaining database credentials, encryption keys, and other
+operator settings. `--keep-env` skips that choice. `--skip-reset` remains a
+compatible explicit way to retain data:
+
+```bash
+python3 setup.py --keep-env --skip-reset
+```
+
+A factory reset is available only with `--reset`, and setup asks for confirmation
+before dependency installation or deployment changes. Do not use it for an upgrade.
+
+Dependency instructions are based on [Docker's Ubuntu](https://docs.docker.com/engine/install/ubuntu/),
+[Debian](https://docs.docker.com/engine/install/debian/), and
+[Windows](https://docs.docker.com/desktop/setup/install/windows-install/) guides,
+the [Microsoft winget package manifest](https://github.com/microsoft/winget-pkgs/tree/master/manifests/d/Docker/DockerDesktop),
+and the [Homebrew Docker Desktop cask](https://formulae.brew.sh/cask/docker-desktop).
 
 ### Manual path (CI / scripted)
 
@@ -246,6 +287,15 @@ under each toggle.
 
 ## Testing
 
+Installer checks use temporary files and mocked system commands; they do not
+install software, start services, or access a database:
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+The backend suite uses the configured environment:
+
 ```bash
 docker compose exec backend pytest -q
 ```
@@ -380,7 +430,7 @@ detectmap/
 
 ## Container reset / fresh start
 
-The interactive installer (`python3 setup.py --reset`) wipes the
+The explicit factory-reset option (`python3 setup.py --reset`) asks for confirmation before wiping the
 database back to a single-admin slate, preserving reference data
 (ATT&CK catalog, frameworks, sector profiles, D3FEND, SigmaHQ defaults)
 where the seeding pipeline can rebuild it. After a wipe:

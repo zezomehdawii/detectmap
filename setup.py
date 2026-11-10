@@ -1,44 +1,27 @@
 #!/usr/bin/env python3
-"""Interactive installer for The Detection Map.
+"""Interactive Detect Map installation (Python 3.10+).
 
-Run from the repo root:
-
-    python3 setup.py
-
-Walks the operator through:
-  * server hostname / IP (used by both CORS and the frontend's API base)
-  * listen port
-  * TLS mode (none / self-signed / use my certificate)
-  * generates a strong .env if one doesn't already exist
-  * generates a self-signed cert via Python's `cryptography` if requested
-  * brings up the docker stack (with the TLS overlay if needed)
-  * factory-resets the database into a single-admin clean slate, with a
-    generated random password and `must_change_password=True`
-  * prints the initial credentials ONCE
-
-Re-running setup is safe: pass --skip-reset to keep your existing data
-or --reset to force the wipe.
-
-REQUIREMENTS
-============
-- Docker + Docker Compose v2 on the host
-- Python 3.10+ on the host
-- `cryptography` (only needed for the self-signed cert path; installed
-   on demand if missing)
+Run python3 setup.py from the repository root. The wizard checks Docker and
+Compose, offers supported dependency installation, suggests host/port values,
+builds application dependencies inside Docker, and initializes administrators
+only for an empty deployment. Existing environment keys and data are kept by
+default. --reset requires an explicit confirmation before any changes.
 """
 from __future__ import annotations
 
 import argparse
-import getpass
 import os
 import re
+from urllib.parse import urlsplit
 import secrets
 import shutil
 import socket
 import subprocess
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
+
+from setup_dependencies import DependencyError, ensure_runtime
 
 REPO_ROOT = Path(__file__).resolve().parent
 ENV_PATH = REPO_ROOT / ".env"
@@ -93,14 +76,16 @@ def prompt(question: str, default: str | None = None) -> str:
     return ans or (default or "")
 
 
-def choose(question: str, options: list[tuple[str, str]]) -> str:
+def choose(question: str, options: list[tuple[str, str]], default: str | None = None) -> str:
     """Numbered menu. `options` = list of (key, label). Returns the key."""
     print(question)
-    for i, (_, label) in enumerate(options, start=1):
-        print(f"  {i}) {label}")
+    for i, (key, label) in enumerate(options, start=1):
+        print(f"  {i}) {label}" + (" (default)" if key == default else ""))
     while True:
         try:
-            raw = input("Choice: ").strip()
+            raw = input("Choice (Enter for default): " if default else "Choice: ").strip()
+            if not raw and default:
+                return default
         except (EOFError, KeyboardInterrupt):
             print()
             sys.exit(130)
@@ -127,34 +112,16 @@ def confirm(question: str, default: bool = False) -> bool:
 
 
 def detect_compose_command() -> list[str]:
-    """Return the docker-compose command tuple. Errors out if missing."""
-    if shutil.which("docker") is None:
-        print(r("docker is not on PATH — install Docker first."))
-        sys.exit(1)
-    # Prefer `docker compose` (v2 plugin) over the legacy `docker-compose`.
-    try:
-        subprocess.run(
-            ["docker", "compose", "version"],
-            check=True,
-            capture_output=True,
-        )
-        return ["docker", "compose"]
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        pass
-    if shutil.which("docker-compose"):
-        return ["docker-compose"]
-    print(r("neither `docker compose` nor `docker-compose` works — install Docker Compose."))
-    sys.exit(1)
+    """Compatibility entry point; checks and optional installs are interactive."""
+    return ensure_runtime(confirm=confirm, prompt=prompt, log=print)
 
 
 def detect_host_ip() -> str:
-    """Best-effort guess at the LAN IP we'd be reachable on."""
+    """Suggest a route-selected IPv4 address without sending any traffic."""
     try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("10.255.255.255", 1))  # never actually transmits
-        ip = s.getsockname()[0]
-        s.close()
-        return ip
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as connection:
+            connection.connect(("10.255.255.255", 1))
+            return connection.getsockname()[0]
     except OSError:
         return "127.0.0.1"
 
@@ -164,11 +131,67 @@ def gen_secret(length: int = 64) -> str:
 
 
 def gen_fernet_key() -> str:
-    # 32 raw bytes → 44 char url-safe base64. The Fernet spec requires
-    # exactly this shape.
     import base64
-
     return base64.urlsafe_b64encode(secrets.token_bytes(32)).decode("ascii")
+
+
+def read_env_values(path: Path = None) -> dict[str, str]:
+    """Read configuration for defaults; never print environment secret values."""
+    path = path or ENV_PATH
+    values = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip() or line.lstrip().startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        values[key.strip()] = value.strip().strip('"').strip("'")
+    return values
+
+
+def deployment_from_env(values: dict[str, str]) -> dict:
+    origin = next((v.strip() for v in values.get("CORS_ORIGINS", "").split(",") if v.strip()), "")
+    parsed = urlsplit(origin)
+    tls_mode = values.get("DETECTMAP_TLS_MODE") or ("byo" if parsed.scheme == "https" else "none")
+    if tls_mode not in {"none", "self-signed", "byo"}:
+        raise ValueError("Saved DETECTMAP_TLS_MODE is invalid; reconfigure the network settings.")
+    host = values.get("DETECTMAP_SERVER_HOST") or parsed.hostname
+    if not host:
+        api = urlsplit(values.get("NEXT_PUBLIC_API_BASE", ""))
+        host = api.hostname or "localhost"
+    if tls_mode == "none":
+        port = values.get("DETECTMAP_HTTP_PORT") or values.get("DETECTMAP_LISTEN_PORT") or parsed.port or 3000
+    else:
+        port = values.get("TLS_LISTEN_PORT") or values.get("DETECTMAP_LISTEN_PORT") or parsed.port or 8443
+    port = int(port)
+    if not 1 <= port <= 65535:
+        raise ValueError("Saved listen port must be between 1 and 65535.")
+    scheme = "http" if tls_mode == "none" else "https"
+    return {"server_host": host, "listen_port": port, "tls_mode": tls_mode,
+            "public_url": f"{scheme}://{host}:{port}"}
+
+
+def update_network_env(*, server_host: str, listen_port: int, tls_mode: str,
+                       cors_origin: str, api_base: str) -> None:
+    """Replace only network settings; leave all other lines/keys intact."""
+    changes = {
+        "CORS_ORIGINS": cors_origin, "NEXT_PUBLIC_API_BASE": api_base,
+        "DETECTMAP_SERVER_HOST": server_host, "DETECTMAP_LISTEN_PORT": str(listen_port),
+        "DETECTMAP_TLS_MODE": tls_mode,
+        "DETECTMAP_HTTP_PORT": str(listen_port if tls_mode == "none" else 3000),
+        "TLS_LISTEN_PORT": str(listen_port if tls_mode != "none" else 8443),
+    }
+    lines = ENV_PATH.read_text(encoding="utf-8").splitlines()
+    output = []
+    network_keys = set(changes)
+    for line in lines:
+        key = line.split("=", 1)[0].strip() if "=" in line and not line.lstrip().startswith("#") else None
+        if key in network_keys:
+            if key in changes:
+                output.append(f"{key}={changes.pop(key)}")
+        else:
+            output.append(line)
+    output.extend(f"{key}={value}" for key, value in changes.items())
+    ENV_PATH.write_text("\n".join(output) + "\n", encoding="utf-8")
+    print(g("  updated network configuration; existing credentials and encryption keys retained"))
 
 
 # ---- .env generation -----------------------------------------------------
@@ -182,14 +205,11 @@ def write_env(
     cors_origin: str,
     api_base: str,
 ) -> None:
-    """Write .env from scratch (overwriting any existing file).
-
-    JWT secrets, the Fernet key, and the internal API key are freshly
-    generated every run — operators who want stable values across runs
-    should keep their .env around (we skip write when --keep-env is set).
-    """
+    """Generate credentials for a new configuration only."""
+    if ENV_PATH.exists():
+        raise ValueError("Refusing to replace an existing .env; update network settings instead.")
     contents = f"""# Generated by setup.py on {datetime.now(timezone.utc).isoformat()}
-# Re-running setup will OVERWRITE this file unless you pass --keep-env.
+# Re-running setup keeps this configuration and encryption keys by default.
 
 # Postgres
 POSTGRES_USER=detectmap
@@ -231,10 +251,11 @@ NEXT_PUBLIC_API_BASE={api_base}
 # Setup-script metadata (read by docker-compose.tls.yml when TLS is on).
 DETECTMAP_SERVER_HOST={server_host}
 DETECTMAP_LISTEN_PORT={listen_port}
+DETECTMAP_HTTP_PORT={listen_port if tls_mode == 'none' else 3000}
 DETECTMAP_TLS_MODE={tls_mode}
 TLS_LISTEN_PORT={listen_port if tls_mode != 'none' else 8443}
 """
-    ENV_PATH.write_text(contents)
+    ENV_PATH.write_text(contents, encoding="utf-8")
     os.chmod(ENV_PATH, 0o600)
     print(g(f"  wrote {ENV_PATH.relative_to(REPO_ROOT)} (0600)"))
 
@@ -242,89 +263,28 @@ TLS_LISTEN_PORT={listen_port if tls_mode != 'none' else 8443}
 # ---- TLS handling --------------------------------------------------------
 
 
-def ensure_cryptography() -> None:
-    """Install `cryptography` on the host if missing — needed for the
-    self-signed cert path. Already a backend dependency; we use Python
-    here to keep setup.py portable across hosts that don't have openssl."""
-    try:
-        import cryptography  # noqa: F401
-        return
-    except ImportError:
-        pass
-    print(d("  installing `cryptography` (one-time)..."))
-    subprocess.check_call(
-        [sys.executable, "-m", "pip", "install", "--quiet", "cryptography"]
-    )
-
-
-def generate_self_signed(server_host: str) -> None:
-    """Produce a self-signed RSA-2048 cert valid for 825 days (the cap
-    most browsers accept) covering the operator's hostname + IP."""
-    ensure_cryptography()
-    from cryptography import x509
-    from cryptography.hazmat.primitives import hashes, serialization
-    from cryptography.hazmat.primitives.asymmetric import rsa
-    from cryptography.x509.oid import NameOID
-
+def generate_self_signed(server_host: str, compose: list[str]) -> None:
     TLS_DIR.mkdir(exist_ok=True)
-    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-    subject = issuer = x509.Name(
-        [
-            x509.NameAttribute(NameOID.COMMON_NAME, server_host),
-            x509.NameAttribute(NameOID.ORGANIZATION_NAME, "The Detection Map"),
-        ]
-    )
-    sans = [x509.DNSName(server_host)]
-    # If they typed an IP literal, also stash it as an IP SAN.
-    try:
-        import ipaddress
-
-        ip = ipaddress.ip_address(server_host)
-        sans.append(x509.IPAddress(ip))
-    except ValueError:
-        pass
-    # Always include localhost / 127.0.0.1 so the operator can hit the
-    # cert from the host even when they accessed via the LAN hostname.
-    sans.extend([x509.DNSName("localhost"), x509.IPAddress(__import__("ipaddress").ip_address("127.0.0.1"))])
-
-    now = datetime.now(timezone.utc)
-    cert = (
-        x509.CertificateBuilder()
-        .subject_name(subject)
-        .issuer_name(issuer)
-        .public_key(key.public_key())
-        .serial_number(x509.random_serial_number())
-        .not_valid_before(now - timedelta(minutes=1))
-        .not_valid_after(now + timedelta(days=825))
-        .add_extension(
-            x509.SubjectAlternativeName(sans),
-            critical=False,
-        )
-        .add_extension(
-            x509.BasicConstraints(ca=False, path_length=None),
-            critical=True,
-        )
-        .sign(key, hashes.SHA256())
-    )
-    KEY_PATH.write_bytes(
-        key.private_bytes(
-            encoding=serialization.Encoding.PEM,
-            format=serialization.PrivateFormat.PKCS8,
-            encryption_algorithm=serialization.NoEncryption(),
-        )
-    )
-    os.chmod(KEY_PATH, 0o600)
-    CERT_PATH.write_bytes(
-        cert.public_bytes(encoding=serialization.Encoding.PEM)
-    )
-    print(g(f"  wrote {CERT_PATH.relative_to(REPO_ROOT)} + {KEY_PATH.relative_to(REPO_ROOT)}"))
+    run_compose(compose, ["build", "backend"], tls=False)
+    run_compose(compose, ["run", "--rm", "--no-deps", "--volume",
+                         f"{TLS_DIR.resolve()}:/tls", "backend", "python", "-m",
+                         "app.scripts.generate_tls", "--host", server_host, "--output", "/tls"], tls=False)
+    print(g("  generated TLS certificate using the backend container; no host Python packages installed"))
 
 
 def copy_user_cert(cert_src: Path, key_src: Path) -> None:
     TLS_DIR.mkdir(exist_ok=True)
-    shutil.copyfile(cert_src, CERT_PATH)
-    shutil.copyfile(key_src, KEY_PATH)
-    os.chmod(KEY_PATH, 0o600)
+    for source, destination, private in [(cert_src, CERT_PATH, False), (key_src, KEY_PATH, True)]:
+        if source.resolve() == destination.resolve():
+            continue
+        temporary = TLS_DIR / (destination.name + "." + secrets.token_hex(6) + ".tmp")
+        try:
+            shutil.copyfile(source, temporary)
+            if private:
+                os.chmod(temporary, 0o600)
+            temporary.replace(destination)
+        finally:
+            temporary.unlink(missing_ok=True)
     print(g(f"  copied cert + key into {TLS_DIR.relative_to(REPO_ROOT)}/"))
 
 
@@ -351,239 +311,172 @@ def write_caddyfile() -> None:
         reverse_proxy frontend:3000
     }
 }
-"""
+""", encoding="utf-8"
     )
     print(g(f"  wrote {CADDYFILE.relative_to(REPO_ROOT)}"))
 
 
-# ---- main ----------------------------------------------------------------
+# ---- deployment ----------------------------------------------------------
+
+
+def compose_command(compose: list[str], tls: bool) -> list[str]:
+    command = list(compose) + ["-f", "docker-compose.yml"]
+    if tls:
+        command += ["-f", "docker-compose.tls.yml"]
+    return command
 
 
 def run_compose(compose: list[str], extra_args: list[str], tls: bool) -> None:
-    cmd = list(compose)
-    cmd += ["-f", "docker-compose.yml"]
-    if tls:
-        cmd += ["-f", "docker-compose.tls.yml"]
-    cmd += extra_args
-    print(d(f"  $ {' '.join(cmd)}"))
-    subprocess.check_call(cmd, cwd=REPO_ROOT)
+    command = compose_command(compose, tls) + extra_args
+    print(d("  $ " + subprocess.list2cmdline(command)))
+    subprocess.check_call(command, cwd=REPO_ROOT)
 
 
-def run_factory_reset(
-    compose: list[str], tls: bool, admin_email: str, super_email: str
-) -> None:
-    cmd = list(compose) + ["-f", "docker-compose.yml"]
-    if tls:
-        cmd += ["-f", "docker-compose.tls.yml"]
-    cmd += [
-        "exec",
-        "-T",
-        "backend",
-        "python",
-        "-m",
-        "app.scripts.factory_reset",
-        "--yes",
-        "--admin-email",
-        admin_email,
-        "--super-email",
-        super_email,
+def wait_for_backend(compose: list[str], tls: bool) -> None:
+    import time
+    print(d("  waiting for backend health..."))
+    deadline = time.monotonic() + 60
+    command = compose_command(compose, tls) + [
+        "exec", "-T", "backend", "curl", "-sf", "http://localhost:8000/health",
     ]
-    print(d(f"  $ {' '.join(cmd)}"))
-    subprocess.check_call(cmd, cwd=REPO_ROOT)
+    while time.monotonic() < deadline:
+        try:
+            subprocess.check_output(command, cwd=REPO_ROOT, stderr=subprocess.DEVNULL, timeout=10)
+            print(g("  backend is ready"))
+            return
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+            time.sleep(2)
+    raise RuntimeError("Backend did not become healthy; inspect docker compose logs backend and rerun setup.")
+
+
+def run_initialization(compose: list[str], tls: bool, admin_email: str, super_email: str) -> None:
+    run_compose(compose, ["exec", "-T", "backend", "python", "-m",
+                         "app.scripts.initialize_admins", "--admin-email", admin_email,
+                         "--super-email", super_email], tls=tls)
+
+
+def run_factory_reset(compose: list[str], tls: bool, admin_email: str, super_email: str) -> None:
+    run_compose(compose, ["exec", "-T", "backend", "python", "-m",
+                         "app.scripts.factory_reset", "--yes", "--admin-email", admin_email,
+                         "--super-email", super_email], tls=tls)
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument(
-        "--keep-env",
-        action="store_true",
-        help="Don't regenerate .env if it already exists",
-    )
-    p.add_argument(
-        "--skip-reset",
-        action="store_true",
-        help="Bring the stack up but don't wipe existing data",
-    )
-    p.add_argument(
-        "--reset",
-        action="store_true",
-        help="Force factory_reset without prompting again",
-    )
-    args = p.parse_args()
-
-    print()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--keep-env", action="store_true", help="Keep existing configuration and keys without prompting")
+    reset_options = parser.add_mutually_exclusive_group()
+    reset_options.add_argument("--skip-reset", action="store_true", help="Keep existing data (also the default); initialize only an empty deployment")
+    reset_options.add_argument("--reset", action="store_true", help="Factory-reset tenant data; requires confirmation")
+    args = parser.parse_args()
     print(b("The Detection Map — interactive setup"))
-    print(d("Press Ctrl-C at any prompt to cancel."))
+    print(d("Press Enter to accept a suggested default; Ctrl-C cancels."))
+    if args.reset and not confirm("Factory reset deletes all customer schemas, users, and MSSP organizations. Proceed?", default=False):
+        print("Cancelled; no installation or deployment changes were made.")
+        return
 
-    compose = detect_compose_command()
+    header("1. Dependencies")
+    compose = ensure_runtime(confirm=confirm, prompt=prompt, log=print)
+    print("Application Python packages, Node.js, PostgreSQL and Redis are installed inside Docker.")
+    print("Host Python packages are not installed or upgraded by this wizard.")
 
-    # ---- 1. Server reachability ----
-    header("1. Server reachability")
-    guessed_ip = detect_host_ip()
-    server_host = prompt(
-        "Hostname or IP this server will be reached on",
-        default=guessed_ip,
-    )
-    if not re.match(r"^[A-Za-z0-9.\-_]+$", server_host):
-        print(r("invalid hostname — only letters, digits, dot, dash, underscore"))
-        sys.exit(1)
-
-    # ---- 2. Port + TLS ----
-    header("2. Transport")
-    tls_mode = choose(
-        "How should the dashboard be served?",
-        [
-            ("none", "HTTP (unencrypted — local network demos only)"),
-            ("self-signed", "HTTPS with a self-signed certificate (no public CA needed)"),
-            ("byo", "HTTPS using a certificate I provide"),
-        ],
-    )
-    default_port = "8443" if tls_mode != "none" else "8080"
-    port_raw = prompt("Listen port", default=default_port)
+    existing = read_env_values() if ENV_PATH.exists() else None
+    keep = bool(existing is not None and (args.keep_env or confirm("Existing .env found. Keep its current configuration and encryption keys?", default=True)))
     try:
-        listen_port = int(port_raw)
-        if not (1 <= listen_port <= 65535):
-            raise ValueError
-    except ValueError:
-        print(r("invalid port"))
-        sys.exit(1)
-
-    if tls_mode == "self-signed":
-        generate_self_signed(server_host)
-        write_caddyfile()
-    elif tls_mode == "byo":
-        cert_path_str = prompt("Path to PEM-encoded certificate (cert.pem)")
-        key_path_str = prompt("Path to PEM-encoded private key (key.pem)")
-        cert_src = Path(cert_path_str).expanduser()
-        key_src = Path(key_path_str).expanduser()
-        if not cert_src.is_file() or not key_src.is_file():
-            print(r("certificate or key not found at the given paths"))
-            sys.exit(1)
-        copy_user_cert(cert_src, key_src)
-        write_caddyfile()
+        saved = deployment_from_env(existing) if existing is not None else None
+    except (ValueError, TypeError):
+        if keep:
+            raise ValueError("Saved network settings are invalid; rerun without --keep-env and choose to reconfigure.") from None
+        saved = None
+    if keep:
+        deployment = saved
+        print(g("  retaining existing .env, application data, and TLS files"))
+        server_host = deployment["server_host"]
+        listen_port = deployment["listen_port"]
+        tls_mode = deployment["tls_mode"]
+        if tls_mode != "none" and not all(path.is_file() for path in (CERT_PATH, KEY_PATH, CADDYFILE)):
+            raise ValueError("Saved TLS configuration is incomplete. Restore tls/cert.pem, key.pem and Caddyfile, or rerun and reconfigure transport.")
     else:
-        # Strip any old TLS material so a previous TLS setup doesn't
-        # leak files into the new HTTP-only deployment.
-        for p in (CERT_PATH, KEY_PATH, CADDYFILE):
-            if p.exists():
-                p.unlink()
+        header("2. Server reachability")
+        guessed_ip = saved["server_host"] if saved else detect_host_ip()
+        print(d(f"  detected hostname: {socket.gethostname()}"))
+        server_host = prompt("Hostname or IP this server will be reached on", default=guessed_ip)
+        if not re.fullmatch(r"[A-Za-z0-9._-]+", server_host):
+            raise ValueError("Invalid hostname/IP; enter a hostname or IPv4 address without a scheme or port.")
+        header("3. Transport")
+        tls_mode = choose("How should the dashboard be served?", [
+            ("none", "HTTP"), ("self-signed", "HTTPS with a self-signed certificate"),
+            ("byo", "HTTPS using a certificate I provide"),
+        ], default=saved["tls_mode"] if saved else "none")
+        default_port = str(saved["listen_port"]) if saved and saved["tls_mode"] == tls_mode else ("8080" if tls_mode == "none" else "8443")
+        while True:
+            try:
+                listen_port = int(prompt("Listen port", default=default_port))
+                if not 1 <= listen_port <= 65535 or (tls_mode == "none" and listen_port == 8000) or (tls_mode != "none" and listen_port in {3000, 8000}):
+                    raise ValueError
+                break
+            except ValueError:
+                print(r("Choose a port from 1–65535; ports used by the direct frontend/API cannot also serve TLS."))
+        scheme = "http" if tls_mode == "none" else "https"
+        deployment = {"server_host": server_host, "listen_port": listen_port,
+                      "tls_mode": tls_mode, "public_url": f"{scheme}://{server_host}:{listen_port}"}
+        # Collect BYO paths before writing any application configuration.
+        if tls_mode == "byo":
+            cert_src = Path(prompt("Path to PEM-encoded certificate (cert.pem)")).expanduser()
+            key_src = Path(prompt("Path to PEM-encoded private key (key.pem)")).expanduser()
+            if not cert_src.is_file() or not key_src.is_file():
+                raise ValueError("Certificate or private key file was not found.")
 
-    # ---- 3. Admin identities ----
-    header("3. Initial administrator")
-    admin_email = prompt(
-        "Email for the MSSP administrator", default="admin@detectmap.local"
-    )
-    super_email = prompt(
-        "Email for the product super admin", default="super@detectmap.local"
-    )
+    header("4. Administrator identities")
+    print(d("  Used only when initializing an empty deployment or when --reset was confirmed."))
+    admin_email = prompt("Email for the MSSP administrator", default="admin@detectmap.local")
+    super_email = prompt("Email for the product super admin", default="super@detectmap.local")
+    if not all(re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", value) and len(value) <= 255 for value in (admin_email, super_email)):
+        raise ValueError("Enter valid administrator email addresses.")
 
-    # ---- 4. Write .env ----
-    header("4. Environment")
-    scheme = "https" if tls_mode != "none" else "http"
-    public_url = f"{scheme}://{server_host}:{listen_port}"
-    cors_origin = public_url
-    # When TLS is on we route through Caddy and the API lives under /api.
-    # In HTTP mode the backend is exposed directly on its own host port,
-    # which we keep at 8000 (untouched by the listen_port choice — that
-    # one belongs to the frontend / Caddy).
-    if tls_mode != "none":
-        api_base = "/api"
+    if not keep:
+        header("5. Environment")
+        kwargs = dict(server_host=server_host, listen_port=listen_port, tls_mode=tls_mode,
+                      cors_origin=deployment["public_url"],
+                      api_base="/api" if tls_mode != "none" else f"http://{server_host}:8000")
+        if existing is not None:
+            update_network_env(**kwargs)
+        else:
+            write_env(**kwargs)
+        if tls_mode == "self-signed":
+            generate_self_signed(server_host, compose)
+            write_caddyfile()
+        elif tls_mode == "byo":
+            copy_user_cert(cert_src, key_src)
+            write_caddyfile()
+        # HTTP mode keeps existing TLS files; no certificate/key deletion.
+
+    # Also honor pre-update .env files without the new HTTP mapping variable.
+    # This changes only this setup process, not the preserved .env contents.
+    os.environ["DETECTMAP_HTTP_PORT"] = str(listen_port if tls_mode == "none" else (existing or {}).get("DETECTMAP_HTTP_PORT", "3000"))
+    os.environ["TLS_LISTEN_PORT"] = str(listen_port if tls_mode != "none" else "8443")
+    header("6. Build and start the application")
+    use_tls = tls_mode != "none"
+    run_compose(compose, ["up", "-d", "--build"], tls=use_tls)
+    wait_for_backend(compose, use_tls)
+    header("7. Initial accounts")
+    if args.reset:
+        run_factory_reset(compose, use_tls, admin_email, super_email)
     else:
-        api_base = f"http://{server_host}:8000"
-
-    if ENV_PATH.exists() and args.keep_env:
-        print(d(f"  keeping existing {ENV_PATH.relative_to(REPO_ROOT)}"))
-    else:
-        write_env(
-            server_host=server_host,
-            listen_port=listen_port,
-            tls_mode=tls_mode,
-            cors_origin=cors_origin,
-            api_base=api_base,
-        )
-
-    # ---- 5. Stack up ----
-    header("5. Bringing up the stack")
-    use_tls_overlay = tls_mode != "none"
-    run_compose(compose, ["up", "-d", "--build"], tls=use_tls_overlay)
-
-    # Wait for the backend to be ready before factory-resetting.
-    import time
-
-    print(d("  waiting for backend health..."))
-    deadline = time.time() + 60
-    while time.time() < deadline:
-        try:
-            # Use compose exec to hit health from inside the network so
-            # we don't depend on the public URL being reachable yet.
-            subprocess.check_output(
-                list(compose)
-                + [
-                    "-f",
-                    "docker-compose.yml",
-                ]
-                + (["-f", "docker-compose.tls.yml"] if use_tls_overlay else [])
-                + [
-                    "exec",
-                    "-T",
-                    "backend",
-                    "curl",
-                    "-sf",
-                    "http://localhost:8000/health",
-                ],
-                cwd=REPO_ROOT,
-                stderr=subprocess.DEVNULL,
-            )
-            print(g("  backend is up"))
-            break
-        except subprocess.CalledProcessError:
-            time.sleep(2)
-    else:
-        print(r("  backend never reported healthy after 60s — check `docker compose logs backend`"))
-        sys.exit(1)
-
-    # ---- 6. Factory reset ----
-    header("6. Initial data")
-    if args.skip_reset:
-        print(d("  --skip-reset passed; leaving existing data in place"))
-    else:
-        if not args.reset:
-            print(
-                y(
-                    "  About to wipe every customer schema, every user, and every"
-                )
-            )
-            print(
-                y(
-                    "  MSSP org. Reference data (ATT&CK, GRC, SigmaHQ, D3FEND,"
-                )
-            )
-            print(y("  sector profiles) is preserved."))
-            if not confirm("  Proceed with factory reset?", default=False):
-                print(d("  skipped — re-run with --reset to do this later"))
-                return
-        run_factory_reset(compose, use_tls_overlay, admin_email, super_email)
-
-    # ---- 7. Final ----
+        run_initialization(compose, use_tls, admin_email, super_email)
     header("Done")
-    print(f"  Dashboard:  {b(public_url)}")
+    print(f"  Dashboard: {deployment['public_url']}")
+    print("  Existing accounts are unchanged. New temporary credentials, if created, were printed above.")
+    print("  New administrators must change their temporary passwords on first sign-in.")
     if tls_mode == "self-signed":
-        print(
-            d(
-                "  (your browser will warn about the self-signed certificate —"
-            )
-        )
-        print(d("   accept the exception to proceed)"))
-    print()
-    print(
-        d(
-            "Credentials were printed above by the factory-reset step. Save"
-        )
-    )
-    print(d("them now — they are not recoverable, and both accounts must change"))
-    print(d("their password on first login."))
-    print()
+        print("  Configure trust for your generated certificate before browser access.")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except (DependencyError, RuntimeError, ValueError, OSError, subprocess.CalledProcessError) as exc:
+        print(r(f"Setup stopped: {exc}"), file=sys.stderr)
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print("Setup cancelled.", file=sys.stderr)
+        sys.exit(130)
