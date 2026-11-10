@@ -47,3 +47,14 @@ desktop.ini
 
 # --- Local tooling ---
 .claude/scheduled_tasks.lock
+
+# --- Local deployment and publication exclusions ---
+.claude/
+docker-compose.override.yml
+detectmap.zip
+*.dump
+*.sql.gz
+tls/
+*.pem
+*.key
+*.pfx

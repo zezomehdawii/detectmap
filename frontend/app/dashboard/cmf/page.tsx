@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Alert,
   Autocomplete,
@@ -45,6 +45,9 @@ import {
   AssetDataSourceOut,
   AssetOut,
   CmfOverview,
+  CmfPlanItem,
+  ConnectorOut,
+  listConnectors,
   DataSourceRecommendation,
   DataSourceVocabItem,
   SectorProfileSummary,
@@ -53,6 +56,8 @@ import {
   VisibilityStateValue,
   createAssetDataSource,
   deleteAssetDataSource,
+  downloadReport,
+  updateCmfPlanItem,
   getCmfOverview,
   getCmfRecommendations,
   getCmfVisibilityMatrix,
@@ -63,6 +68,7 @@ import {
   listSectorProfiles,
   updateAssetDataSource,
 } from '@/lib/api';
+import { apiErrorMessage, formatAttackDataSource, splitAttackDataSource, validRetention } from '@/lib/cmf-utils';
 import { coverage } from '../../theme';
 import { PlanTab, RequirementsTab } from './CmfLifecycle';
 
@@ -367,19 +373,27 @@ function DataSourceDialog({
   vocab: DataSourceVocabItem[];
   initial: (AssetDataSourceInput & { asset_id?: string; id?: string }) | null;
   editing: { assetId: string; dsId: string } | null;
-  onSaved: () => void;
+  onSaved: (source: AssetDataSourceOut) => void | Promise<void>;
 }) {
   const [form, setForm] = useState<AssetDataSourceInput & { asset_id?: string }>(EMPTY_FORM);
+  const [attackRaw, setAttackRaw] = useState('');
+  const [connectors, setConnectors] = useState<ConnectorOut[]>([]);
   const [saving, setSaving] = useState(false);
   const [err, setErr] = useState<string | null>(null);
 
   useEffect(() => {
     if (open) {
       setForm({ ...EMPTY_FORM, ...(initial ?? {}) });
+      setAttackRaw(formatAttackDataSource(initial?.attack_data_source, initial?.attack_data_component));
       setErr(null);
     }
   }, [open, initial]);
 
+  useEffect(() => {
+    let cancelled = false;
+    if (open) listConnectors().then((rows) => { if (!cancelled) setConnectors(rows); }).catch(() => { if (!cancelled) setConnectors([]); });
+    return () => { cancelled = true; };
+  }, [open]);
   const set = (patch: Partial<AssetDataSourceInput & { asset_id?: string }>) =>
     setForm((f) => ({ ...f, ...patch }));
 
@@ -388,19 +402,29 @@ function DataSourceDialog({
       setErr('Asset and source name are required.');
       return;
     }
+    if (!validRetention(form.retention_days)) {
+      setErr('Retention must be a whole number of days, zero or greater.');
+      return;
+    }
     setSaving(true);
     setErr(null);
     try {
       const { asset_id, ...payload } = form;
-      if (editing) {
-        await updateAssetDataSource(editing.assetId, editing.dsId, payload);
-      } else {
-        await createAssetDataSource(asset_id, payload);
+      const mapping = splitAttackDataSource(attackRaw);
+      Object.assign(payload, mapping);
+      for (const field of ['log_source', 'description', 'storage_location', 'kill_chain_phase', 'follow_on_collection', 'notes'] as const) {
+        if (typeof payload[field] === 'string') payload[field] = payload[field]?.trim() || null;
       }
-      onSaved();
+      let saved: AssetDataSourceOut;
+      if (editing) {
+        saved = await updateAssetDataSource(editing.assetId, editing.dsId, payload);
+      } else {
+        saved = await createAssetDataSource(asset_id, payload);
+      }
+      await onSaved(saved);
       onClose();
     } catch (e: any) {
-      setErr(e?.response?.data?.detail ?? 'Save failed.');
+      setErr(apiErrorMessage(e, 'Save failed.'));
     } finally {
       setSaving(false);
     }
@@ -439,9 +463,10 @@ function DataSourceDialog({
             freeSolo
             size="small"
             options={vocab.map((v) => v.raw)}
-            value={form.attack_data_source ?? ''}
-            onChange={(_, v) => set({ attack_data_source: v ?? '' })}
-            onInputChange={(_, v) => set({ attack_data_source: v })}
+            value={attackRaw}
+            inputValue={attackRaw}
+            onChange={(_, v) => setAttackRaw(v ?? '')}
+            onInputChange={(_, v) => setAttackRaw(v)}
             renderInput={(params) => (
               <TextField
                 {...params}
@@ -462,6 +487,7 @@ function DataSourceDialog({
               label="Retention (days)"
               size="small"
               type="number"
+              inputProps={{ min: 0, step: 1 }}
               sx={{ width: 160 }}
               value={form.retention_days ?? ''}
               onChange={(e) =>
@@ -469,6 +495,24 @@ function DataSourceDialog({
               }
             />
           </Stack>
+          <TextField select label="Storage platform / connector" size="small"
+            value={form.storage_connector_id ?? ''} onChange={(e) => set({ storage_connector_id: e.target.value || null })}>
+            <MenuItem value="">— none / local storage —</MenuItem>
+            {form.storage_connector_id && !connectors.some((c) => c.id === form.storage_connector_id) && <MenuItem value={form.storage_connector_id}>Current connector</MenuItem>}
+            {connectors.map((connector) => <MenuItem key={connector.id} value={connector.id}>{connector.label}</MenuItem>)}
+          </TextField>
+          <TextField label="Data store location" size="small" value={form.storage_location ?? ''}
+            onChange={(e) => set({ storage_location: e.target.value })}
+            helperText="SIEM index/table, file path, or local device storage" />
+          <TextField label="Kill chain phase" size="small" value={form.kill_chain_phase ?? ''}
+            onChange={(e) => set({ kill_chain_phase: e.target.value })} />
+          <TextField label="Follow-on collection" size="small" multiline minRows={2}
+            value={form.follow_on_collection ?? ''}
+            onChange={(e) => set({ follow_on_collection: e.target.value })} />
+          <TextField label="Description" size="small" multiline minRows={2}
+            value={form.description ?? ''} onChange={(e) => set({ description: e.target.value })} />
+          <TextField label="Collection / validation notes" size="small" multiline minRows={2}
+            value={form.notes ?? ''} onChange={(e) => set({ notes: e.target.value })} />
           <Divider textAlign="left">
             <Typography variant="caption" color="text.secondary">
               DeTT&amp;CT data quality (0–5, blank = unscored)
@@ -521,9 +565,16 @@ function DataSourceDialog({
 
 interface RegisterRow extends AssetDataSourceOut {
   asset_name: string;
+  asset_kind: string;
+  site: string | null;
 }
 
 export default function CmfPage() {
+  const requestVersion = useRef(0);
+  const registerVersion = useRef(0);
+  const [planVersion, setPlanVersion] = useState(0);
+  const [implementingPlan, setImplementingPlan] = useState<CmfPlanItem | null>(null);
+  const [exporting, setExporting] = useState(false);
   const [tab, setTab] = useState<TabKey>('overview');
 
   // denominator
@@ -535,6 +586,7 @@ export default function CmfPage() {
   const [groupQuery, setGroupQuery] = useState('');
 
   // data
+  const [loadedScope, setLoadedScope] = useState('');
   const [overview, setOverview] = useState<CmfOverview | null>(null);
   const [matrix, setMatrix] = useState<VisibilityMatrix | null>(null);
   const [recs, setRecs] = useState<DataSourceRecommendation[]>([]);
@@ -573,55 +625,67 @@ export default function CmfPage() {
   );
 
   const loadRegister = useCallback(async () => {
+    const version = ++registerVersion.current;
     const a = await listAssets();
-    setAssets(a);
     const lists = await Promise.all(
       a.map((asset) =>
         listAssetDataSources(asset.id)
-          .then((ds) => ds.map((d) => ({ ...d, asset_name: asset.name })))
-          .catch(() => [] as RegisterRow[]),
+          .then((ds) => ds.map((d) => ({ ...d, asset_name: asset.name, asset_kind: asset.kind, site: asset.location }))),
       ),
     );
+    if (version !== registerVersion.current) return;
+    setAssets(a);
     setRegister(lists.flat());
   }, []);
 
+  const scopeReady = kind === 'full' || !!refValue;
+  const scopeKey = JSON.stringify(q);
   const load = useCallback(async () => {
+    const version = ++requestVersion.current;
+    setOverview(null);
+    setMatrix(null);
+    setRecs([]);
+    setSelected(null);
+    setError(null);
     if (kind !== 'full' && !refValue) {
       setLoading(false);
       return;
     }
     setLoading(true);
-    setError(null);
     try {
       const [ov, mx, rc] = await Promise.all([
-        getCmfOverview(q),
-        getCmfVisibilityMatrix(q),
-        getCmfRecommendations(q, 25),
+        getCmfOverview(q), getCmfVisibilityMatrix(q), getCmfRecommendations(q, 25),
       ]);
+      if (version !== requestVersion.current) return;
+      setLoadedScope(JSON.stringify(q));
       setOverview(ov);
       setMatrix(mx);
       setRecs(rc);
-      await loadRegister();
-    } catch (e: any) {
-      setError(
-        e?.response?.data?.detail ??
-          'Failed to load — pick a customer in the topbar if you are an MSSP user.',
-      );
+    } catch (e) {
+      if (version === requestVersion.current) setError(apiErrorMessage(e, 'Failed to load collection analysis.'));
     } finally {
-      setLoading(false);
+      if (version === requestVersion.current) setLoading(false);
     }
-  }, [q, kind, refValue, loadRegister]);
+  }, [q, kind, refValue]);
 
   useEffect(() => {
     load();
+    return () => { requestVersion.current += 1; };
   }, [load]);
 
-  const openAdd = (prefill?: Partial<AssetDataSourceInput>) => {
+  useEffect(() => {
+    loadRegister().catch((e) => setError(apiErrorMessage(e, 'Failed to load the collection register.')));
+    return () => { registerVersion.current += 1; };
+  }, [loadRegister]);
+
+  const openAdd = (prefill?: Partial<AssetDataSourceInput> & { asset_id?: string }, plan?: CmfPlanItem) => {
+    setImplementingPlan(plan ?? null);
     setEditing(null);
     setDialogInitial({ name: '', enabled: true, ...(prefill ?? {}) });
     setDialogOpen(true);
   };
   const openEdit = (row: RegisterRow) => {
+    setImplementingPlan(null);
     setEditing({ assetId: row.asset_id, dsId: row.id });
     setDialogInitial({
       asset_id: row.asset_id,
@@ -636,13 +700,29 @@ export default function CmfPage() {
       consistency_q: row.consistency_q,
       retention_q: row.retention_q,
       enabled: row.enabled,
+      storage_connector_id: row.storage_connector_id,
+      storage_location: row.storage_location,
+      description: row.description,
+      kill_chain_phase: row.kill_chain_phase,
+      follow_on_collection: row.follow_on_collection,
       notes: row.notes ?? '',
     });
     setDialogOpen(true);
   };
+  const implementPlan = (item: CmfPlanItem) => {
+    const linked = register.find((row) => row.id === item.asset_data_source_id && row.asset_id === item.target_asset_id);
+    if (linked) {
+      openEdit(linked);
+      setImplementingPlan(item);
+    } else {
+      openAdd({ name: item.data_source, ...splitAttackDataSource(item.data_source), asset_id: item.target_asset_id ?? undefined }, item);
+    }
+  };
   const removeRow = async (row: RegisterRow) => {
-    await deleteAssetDataSource(row.asset_id, row.id);
-    await Promise.all([loadRegister(), load()]);
+    try {
+      await deleteAssetDataSource(row.asset_id, row.id);
+      await Promise.all([loadRegister(), load()]);
+    } catch (e) { setError(apiErrorMessage(e, 'Could not delete the collection source.')); }
   };
 
   const TABS: { key: TabKey; label: string }[] = [
@@ -654,8 +734,14 @@ export default function CmfPage() {
     { key: 'recommendations', label: 'Recommendations' },
   ];
 
-  const isAnalytics =
-    tab === 'overview' || tab === 'matrix' || tab === 'recommendations' || tab === 'register';
+  const isAnalytics = tab === 'overview' || tab === 'matrix' || tab === 'recommendations';
+
+  const exportCmf = async (format: 'json' | 'csv') => {
+    setExporting(true);
+    try { await downloadReport(`/cmf/export.${format}`, `cmf-submission.${format}`); }
+    catch (e) { setError(apiErrorMessage(e, 'CMF export failed.')); }
+    finally { setExporting(false); }
+  };
 
   return (
     <Stack spacing={2.5}>
@@ -669,6 +755,11 @@ export default function CmfPage() {
         </Typography>
       </Box>
 
+      <Stack direction="row" spacing={1}>
+        <Button variant="outlined" size="small" disabled={exporting} onClick={() => exportCmf('json')}>Export submission (JSON)</Button>
+        <Button variant="outlined" size="small" disabled={exporting} onClick={() => exportCmf('csv')}>Export register (CSV)</Button>
+      </Stack>
+      <Alert severity="info">Visibility summarizes collection across this customer. It does not establish collection on every asset or prove that a detection works.</Alert>
       <DenominatorPicker
         domain={domain}
         setDomain={setDomain}
@@ -698,18 +789,18 @@ export default function CmfPage() {
       {/* Requirements + Plan are self-contained (load their own data) and
           don't depend on the visibility denominator load. */}
       {tab === 'requirements' && <RequirementsTab />}
-      {tab === 'plan' && <PlanTab q={q} onChanged={load} />}
+      {tab === 'plan' && <PlanTab key={planVersion} q={q} onChanged={load} onImplement={implementPlan} />}
 
-      {isAnalytics && error && <Alert severity="warning">{error}</Alert>}
+      {error && <Alert severity="warning">{error}</Alert>}
       {isAnalytics && loading && <LinearProgress />}
 
       {isAnalytics && !loading && kind !== 'full' && !refValue && (
         <Alert severity="info">Pick a {kind === 'sector' ? 'sector' : 'APT group'} to scope the analysis.</Alert>
       )}
 
-      {isAnalytics && !loading && !error && overview && (
+      {((isAnalytics && scopeReady && loadedScope === scopeKey && !loading && !error && overview) || tab === 'register') && (
         <>
-          {tab === 'overview' && (
+          {tab === 'overview' && overview && (
             <Stack spacing={2.5}>
               <Stack direction="row" spacing={2} flexWrap="wrap" useFlexGap>
                 <Card sx={{ flex: '1 1 220px', minWidth: 220 }}>
@@ -910,27 +1001,29 @@ export default function CmfPage() {
                 </Stack>
                 {assets.length === 0 ? (
                   <Alert severity="info">
-                    No assets yet — add assets in the customer profile first, then record what each
-                    one collects here.
+                    No assets yet. Ask the instructor to load the classroom inventory, or add assets in the customer profile.
                   </Alert>
                 ) : (
-                  <Table size="small">
+                  <Box sx={{ overflowX: 'auto' }}><Table size="small" sx={{ minWidth: 1300 }}>
                     <TableHead>
                       <TableRow>
-                        <TableCell>Asset</TableCell>
+                        <TableCell>Asset / type / site</TableCell>
                         <TableCell>Source</TableCell>
                         <TableCell>ATT&amp;CK data source</TableCell>
                         <TableCell>Log source</TableCell>
+                        <TableCell>Storage</TableCell>
+                        <TableCell>Kill chain phase</TableCell>
+                        <TableCell>Follow-on collection</TableCell>
                         <TableCell align="right">Retention</TableCell>
                         <TableCell align="center">Quality</TableCell>
                         <TableCell align="center">On</TableCell>
-                        <TableCell align="right" />
+                        <TableCell align="right">Actions</TableCell>
                       </TableRow>
                     </TableHead>
                     <TableBody>
                       {register.length === 0 && (
                         <TableRow>
-                          <TableCell colSpan={8}>
+                          <TableCell colSpan={11}>
                             <Typography variant="body2" color="text.secondary">
                               No collection sources recorded yet.
                             </Typography>
@@ -941,10 +1034,13 @@ export default function CmfPage() {
                         const qv = avgQuality(row);
                         return (
                           <TableRow key={row.id} hover>
-                            <TableCell>{row.asset_name}</TableCell>
+                            <TableCell>{row.asset_name}<Typography variant="caption" display="block" color="text.secondary">{row.asset_kind} · {row.site ?? 'site unspecified'}</Typography></TableCell>
                             <TableCell sx={{ fontWeight: 600 }}>{row.name}</TableCell>
-                            <TableCell>{row.attack_data_source ?? '—'}</TableCell>
+                            <TableCell>{formatAttackDataSource(row.attack_data_source, row.attack_data_component) || '—'}</TableCell>
                             <TableCell>{row.log_source ?? '—'}</TableCell>
+                            <TableCell>{row.storage_location ?? '—'}</TableCell>
+                            <TableCell>{row.kill_chain_phase ?? '—'}</TableCell>
+                            <TableCell>{row.follow_on_collection ?? '—'}</TableCell>
                             <TableCell align="right">
                               {row.retention_days != null ? `${row.retention_days}d` : '—'}
                             </TableCell>
@@ -963,6 +1059,8 @@ export default function CmfPage() {
                             </TableCell>
                             <TableCell align="center">
                               <Box
+                                role="img"
+                                aria-label={row.enabled ? 'Collection enabled' : 'Collection disabled'}
                                 sx={{
                                   width: 10,
                                   height: 10,
@@ -973,10 +1071,10 @@ export default function CmfPage() {
                               />
                             </TableCell>
                             <TableCell align="right">
-                              <IconButton size="small" onClick={() => openEdit(row)}>
+                              <IconButton size="small" aria-label={`Edit ${row.name} collection source`} onClick={() => openEdit(row)}>
                                 <EditRoundedIcon fontSize="small" />
                               </IconButton>
-                              <IconButton size="small" onClick={() => removeRow(row)}>
+                              <IconButton size="small" aria-label={`Delete ${row.name} collection source`} onClick={() => removeRow(row)}>
                                 <DeleteOutlineRoundedIcon fontSize="small" />
                               </IconButton>
                             </TableCell>
@@ -984,7 +1082,7 @@ export default function CmfPage() {
                         );
                       })}
                     </TableBody>
-                  </Table>
+                  </Table></Box>
                 )}
               </CardContent>
             </Card>
@@ -1087,7 +1185,20 @@ export default function CmfPage() {
         vocab={vocab}
         initial={dialogInitial}
         editing={editing}
-        onSaved={() => Promise.all([loadRegister(), load()])}
+        onSaved={async (source) => {
+          let linkError: string | null = null;
+          if (implementingPlan) {
+            try {
+              await updateCmfPlanItem(implementingPlan.id, { asset_data_source_id: source.id, target_asset_id: source.asset_id, status: 'collected' });
+              setPlanVersion((value) => value + 1);
+            } catch (e) {
+              linkError = apiErrorMessage(e, 'Source saved, but linking it to the plan failed. Edit the plan to link the saved source.');
+            }
+          }
+          try { await Promise.all([loadRegister(), load()]); }
+          catch (e) { setError(apiErrorMessage(e, 'Source saved. Refresh the collection register to see the latest result.')); }
+          if (linkError) setError(linkError);
+        }}
       />
     </Stack>
   );

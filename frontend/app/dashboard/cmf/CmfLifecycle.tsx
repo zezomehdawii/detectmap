@@ -29,6 +29,8 @@ import EditRoundedIcon from '@mui/icons-material/EditRounded';
 
 import {
   AssetOut,
+  AssetDataSourceOut,
+  listAssetDataSources,
   CMF_DRIVERS,
   CMF_PLAN_STATUSES,
   CMF_PRIORITIES,
@@ -51,6 +53,7 @@ import {
   updateCmfPlanItem,
   updateCmfRequirement,
 } from '@/lib/api';
+import { apiErrorMessage, formatAttackDataSource } from '@/lib/cmf-utils';
 import { coverage } from '../../theme';
 
 const human = (s: string) => s.replace(/_/g, ' ').replace(/^\w/, (c) => c.toUpperCase());
@@ -136,7 +139,7 @@ function RequirementDialog({
       onSaved();
       onClose();
     } catch (e: any) {
-      setErr(e?.response?.data?.detail ?? 'Save failed.');
+      setErr(apiErrorMessage(e, 'Save failed.'));
     } finally {
       setSaving(false);
     }
@@ -214,7 +217,7 @@ function RequirementDialog({
             value={tidText}
             onChange={(e) => setTidText(e.target.value)}
             placeholder="T1558.003, T1003.001"
-            helperText="Optional — scopes which data sources satisfy this requirement"
+            helperText="Optional references for this collection requirement"
           />
         </Stack>
       </DialogContent>
@@ -242,8 +245,7 @@ export function RequirementsTab() {
       setItems(await listCmfRequirements());
     } catch (e: any) {
       setError(
-        e?.response?.data?.detail ??
-          'Failed to load — pick a customer in the topbar if you are an MSSP user.',
+        apiErrorMessage(e, 'Failed to load collection records.'),
       );
     } finally {
       setLoading(false);
@@ -255,8 +257,8 @@ export function RequirementsTab() {
   }, [load]);
 
   const remove = async (id: string) => {
-    await deleteCmfRequirement(id);
-    load();
+    try { await deleteCmfRequirement(id); await load(); }
+    catch (e) { setError(apiErrorMessage(e, 'Could not delete the requirement.')); }
   };
 
   return (
@@ -405,6 +407,8 @@ function PlanItemDialog({
   onSaved: () => void;
 }) {
   const [form, setForm] = useState<CmfPlanItemInput>(EMPTY_PLAN);
+  const [sources, setSources] = useState<AssetDataSourceOut[]>([]);
+  const [sourcesLoading, setSourcesLoading] = useState(false);
   const [saving, setSaving] = useState(false);
   const [err, setErr] = useState<string | null>(null);
 
@@ -415,11 +419,31 @@ function PlanItemDialog({
     }
   }, [open, initial]);
 
+  useEffect(() => {
+    let cancelled = false;
+    setSources([]);
+    if (!open || !form.target_asset_id) { setSourcesLoading(false); return; }
+    setSourcesLoading(true);
+    listAssetDataSources(form.target_asset_id)
+      .then((rows) => { if (!cancelled) setSources(rows); })
+      .catch((e) => { if (!cancelled) setErr(apiErrorMessage(e, 'Could not load collection sources.')); })
+      .finally(() => { if (!cancelled) setSourcesLoading(false); });
+    return () => { cancelled = true; };
+  }, [open, form.target_asset_id]);
+
   const set = (p: Partial<CmfPlanItemInput>) => setForm((f) => ({ ...f, ...p }));
 
   const save = async () => {
     if (!form.data_source?.trim()) {
       setErr('Data source is required.');
+      return;
+    }
+    if (['collected', 'validated'].includes(form.status ?? '') && !form.asset_data_source_id) {
+      setErr('Link the implemented collection source before marking this item collected or validated.');
+      return;
+    }
+    if (form.status === 'validated' && !form.notes?.trim()) {
+      setErr('Record the test and its result before marking this item validated.');
       return;
     }
     setSaving(true);
@@ -429,13 +453,16 @@ function PlanItemDialog({
         ...form,
         requirement_id: form.requirement_id || null,
         target_asset_id: form.target_asset_id || null,
+        asset_data_source_id: form.asset_data_source_id || null,
+        due_date: form.due_date || null,
+        notes: form.notes?.trim() || null,
       };
       if (editingId) await updateCmfPlanItem(editingId, payload);
       else await createCmfPlanItem(payload);
       onSaved();
       onClose();
     } catch (e: any) {
-      setErr(e?.response?.data?.detail ?? 'Save failed.');
+      setErr(apiErrorMessage(e, 'Save failed.'));
     } finally {
       setSaving(false);
     }
@@ -452,8 +479,8 @@ function PlanItemDialog({
             size="small"
             options={vocab.map((v) => v.raw)}
             value={form.data_source ?? ''}
-            onChange={(_, v) => set({ data_source: v ?? '' })}
-            onInputChange={(_, v) => set({ data_source: v })}
+            onChange={(_, v) => set({ data_source: v ?? '', asset_data_source_id: null })}
+            onInputChange={(_, v, reason) => { if (reason === 'input' || reason === 'clear') set({ data_source: v, asset_data_source_id: null }); }}
             renderInput={(params) => (
               <TextField {...params} label="ATT&CK data source to collect" required />
             )}
@@ -488,7 +515,7 @@ function PlanItemDialog({
               size="small"
               fullWidth
               value={form.target_asset_id ?? ''}
-              onChange={(e) => set({ target_asset_id: e.target.value })}
+              onChange={(e) => set({ target_asset_id: e.target.value, asset_data_source_id: null })}
             >
               <MenuItem value="">— none —</MenuItem>
               {assets.map((a) => (
@@ -498,6 +525,17 @@ function PlanItemDialog({
               ))}
             </TextField>
           </Stack>
+          <TextField select label="Implemented collection source" size="small"
+            value={sources.some((source) => source.id === form.asset_data_source_id) ? form.asset_data_source_id : ''}
+            disabled={!form.target_asset_id || sourcesLoading}
+            onChange={(e) => set({ asset_data_source_id: e.target.value || null })}
+            helperText="Choose an enabled source matching this plan on the target asset. Use Record collection to add one.">
+            <MenuItem value="">— not linked —</MenuItem>
+            {sources.map((source) => <MenuItem key={source.id} value={source.id} disabled={!source.enabled || (formatAttackDataSource(source.attack_data_source, source.attack_data_component) || source.name).trim().toLowerCase() !== (form.data_source ?? '').trim().toLowerCase()}>{source.name} · {formatAttackDataSource(source.attack_data_source, source.attack_data_component) || 'unmapped'}{source.enabled ? '' : ' (disabled)'}</MenuItem>)}
+          </TextField>
+          <TextField label="Test / validation notes" size="small" multiline minRows={3}
+            value={form.notes ?? ''} onChange={(e) => set({ notes: e.target.value })}
+            helperText="Record test date, evidence reference, expected and observed result, and any remaining gap. Required for Validated." />
           <Stack direction="row" spacing={2}>
             <TextField
               select
@@ -557,7 +595,7 @@ function PlanItemDialog({
   );
 }
 
-export function PlanTab({ q, onChanged }: { q: CmfQuery; onChanged?: () => void }) {
+export function PlanTab({ q, onChanged, onImplement }: { q: CmfQuery; onChanged?: () => void; onImplement?: (item: CmfPlanItem) => void }) {
   const [items, setItems] = useState<CmfPlanItem[]>([]);
   const [requirements, setRequirements] = useState<CmfRequirement[]>([]);
   const [assets, setAssets] = useState<AssetOut[]>([]);
@@ -583,8 +621,7 @@ export function PlanTab({ q, onChanged }: { q: CmfQuery; onChanged?: () => void 
       setAssets(as);
     } catch (e: any) {
       setError(
-        e?.response?.data?.detail ??
-          'Failed to load — pick a customer in the topbar if you are an MSSP user.',
+        apiErrorMessage(e, 'Failed to load collection records.'),
       );
     } finally {
       setLoading(false);
@@ -618,21 +655,30 @@ export function PlanTab({ q, onChanged }: { q: CmfQuery; onChanged?: () => void 
       await load();
       onChanged?.();
     } catch (e: any) {
-      setSeedMsg(e?.response?.data?.detail ?? 'Seeding failed.');
+      setError(apiErrorMessage(e, 'Seeding failed.'));
     } finally {
       setSeeding(false);
     }
   };
 
   const changeStatus = async (item: CmfPlanItem, status: string) => {
-    await updateCmfPlanItem(item.id, { status });
-    await load();
-    onChanged?.();
+    if (['collected', 'validated'].includes(status)) {
+      setEditing({ ...item, status });
+      setDialogOpen(true);
+      return;
+    }
+    try {
+      await updateCmfPlanItem(item.id, { status });
+      await load();
+      onChanged?.();
+    } catch (e) { setError(apiErrorMessage(e, 'Could not update the plan status.')); }
   };
   const remove = async (id: string) => {
-    await deleteCmfPlanItem(id);
-    await load();
-    onChanged?.();
+    try {
+      await deleteCmfPlanItem(id);
+      await load();
+      onChanged?.();
+    } catch (e) { setError(apiErrorMessage(e, 'Could not delete the plan item.')); }
   };
 
   return (
@@ -661,7 +707,7 @@ export function PlanTab({ q, onChanged }: { q: CmfQuery; onChanged?: () => void 
                   size="small"
                   startIcon={<AutoFixHighRoundedIcon />}
                   onClick={seed}
-                  disabled={seeding}
+                  disabled={seeding || (q.denominator !== 'full' && !q.ref)}
                 >
                   {seeding ? 'Seeding…' : 'Seed from gaps'}
                 </Button>
@@ -734,6 +780,7 @@ export function PlanTab({ q, onChanged }: { q: CmfQuery; onChanged?: () => void 
                       <Typography variant="body2" sx={{ fontWeight: 600 }}>
                         {it.data_source}
                       </Typography>
+                      {it.notes && <Typography variant="caption" display="block" sx={{ maxWidth: 320, whiteSpace: 'pre-wrap' }}>{it.notes}</Typography>}
                       {it.source_kind === 'gap_seed' && (
                         <Chip size="small" label="from gaps" sx={{ height: 18, fontSize: 10, mt: 0.25 }} />
                       )}
@@ -776,9 +823,13 @@ export function PlanTab({ q, onChanged }: { q: CmfQuery; onChanged?: () => void 
                       <Typography variant="body2" color="text.secondary">
                         {it.target_asset_name ?? '—'}
                       </Typography>
+                      {it.asset_data_source_id && <Typography variant="caption" display="block" color="success.main">Collection source linked</Typography>}
                     </td>
                     <td style={{ textAlign: 'right' }}>{it.technique_count || '—'}</td>
                     <td style={{ textAlign: 'right', whiteSpace: 'nowrap' }}>
+                      <Tooltip title={it.target_asset_id ? 'Record a source on the target asset and link it to this plan' : 'Edit this plan item and choose a target asset first'}>
+                        <span><Button size="small" disabled={!it.target_asset_id} onClick={() => onImplement?.(it)}>Record collection</Button></span>
+                      </Tooltip>
                       <IconButton
                         size="small"
                         onClick={() => {
@@ -809,6 +860,8 @@ export function PlanTab({ q, onChanged }: { q: CmfQuery; onChanged?: () => void 
                   rationale: editing.rationale ?? '',
                   requirement_id: editing.requirement_id ?? '',
                   target_asset_id: editing.target_asset_id ?? '',
+                  asset_data_source_id: editing.asset_data_source_id ?? '',
+                  notes: editing.notes ?? '',
                   priority: editing.priority,
                   status: editing.status,
                   assigned_to: editing.assigned_to ?? '',

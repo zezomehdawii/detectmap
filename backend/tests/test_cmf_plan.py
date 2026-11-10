@@ -16,6 +16,10 @@ from app.db.tenant import set_tenant, tenant_session
 from app.main import app
 from app.models.customer import CollectionPlanItem, CollectionRequirement
 
+# These fixtures deliberately wipe shared tenant tables. Exclude them from the
+# default suite; only opt in against a disposable test database.
+pytestmark = pytest.mark.wipes_db
+
 
 def _client(token: str, customer: str = "acme") -> AsyncClient:
     return AsyncClient(

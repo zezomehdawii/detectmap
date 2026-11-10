@@ -48,6 +48,7 @@ from app.db.base import AsyncSessionLocal
 from app.db.tenant import tenant_session
 from app.models.customer import Asset, AssetDataSource
 from app.models.public import AttackTechnique
+from app.services.cmf_sources import normalize_source_fields
 from app.services.coverage import (
     TACTIC_ORDER,
     DenominatorKind,
@@ -213,6 +214,10 @@ class _Collected:
     full: set[str]                       # "Source: Component" keys collected
     sources: set[str]                    # bare "Source" keys collected
     quality_by_key: dict[str, list[float]]  # key → row qualities (full + source keys)
+    # Bare source entries can imply partial visibility. A different collected
+    # component must not imply presence or quality of an uncollected sibling.
+    parent_sources: Optional[set[str]] = None
+    parent_quality_by_key: Optional[dict[str, list[float]]] = None
 
 
 async def _fetch_collected(session: AsyncSession) -> _Collected:
@@ -230,22 +235,32 @@ async def _fetch_collected(session: AsyncSession) -> _Collected:
     sources: set[str] = set()
     quality_by_key: dict[str, list[float]] = defaultdict(list)
 
+    parent_sources: set[str] = set()
+    parent_quality: dict[str, list[float]] = defaultdict(list)
     for r in rows:
-        src = (r.attack_data_source or "").strip()
+        mapping = normalize_source_fields({
+            "attack_data_source": r.attack_data_source,
+            "attack_data_component": r.attack_data_component,
+        })
+        src = mapping["attack_data_source"] or ""
         if not src:
             continue
-        comp = (r.attack_data_component or "").strip()
+        comp = mapping["attack_data_component"] or ""
+        if not comp:
+            parent_sources.add(src)
         sources.add(src)
         q = _row_quality(r)
         if q is not None:
             quality_by_key[src].append(q)
+            if not comp:
+                parent_quality[src].append(q)
         if comp:
             full_key = f"{src}: {comp}"
             full.add(full_key)
             if q is not None:
                 quality_by_key[full_key].append(q)
 
-    return _Collected(full=full, sources=sources, quality_by_key=quality_by_key)
+    return _Collected(full=full, sources=sources, quality_by_key=quality_by_key, parent_sources=parent_sources, parent_quality_by_key=parent_quality)
 
 
 # ---- per-technique assessment ---------------------------------------------
@@ -275,9 +290,18 @@ def _assess(required: list[str], collected: _Collected) -> _Assessment:
             full_matched += 1
             any_matched += 1
             quals.extend(collected.quality_by_key.get(raw, []))
-        elif src in collected.sources:
+        elif src in collected.sources and (
+            not has_comp or src in (
+                collected.parent_sources if collected.parent_sources is not None else collected.sources
+            )
+        ):
             any_matched += 1
-            quals.extend(collected.quality_by_key.get(src, []))
+            quality = (
+                collected.parent_quality_by_key
+                if has_comp and collected.parent_quality_by_key is not None
+                else collected.quality_by_key
+            )
+            quals.extend(quality.get(src, []))
             if has_comp:
                 # parent source collected but not this specific component
                 missing.append(raw)

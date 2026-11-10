@@ -14,14 +14,15 @@ from datetime import date, datetime
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import delete, func, select
 
 from app.api.deps import TenantPrincipal, require_active_customer, require_perm
 from app.core.rbac import Permission
 from app.db.tenant import tenant_session
-from app.models.customer import Asset, CollectionPlanItem, CollectionRequirement
+from app.models.customer import Asset, AssetDataSource, CollectionPlanItem, CollectionRequirement
 from app.services.cmf_visibility import DenominatorKind, compute_recommendations
+from app.services.cmf_sources import normalize_source_fields
 
 router = APIRouter(prefix="/cmf", tags=["cmf"])
 
@@ -43,6 +44,51 @@ def _validate(value: str, allowed: set, field: str) -> str:
     if value not in allowed:
         raise HTTPException(422, f"{field} must be one of {sorted(allowed)}")
     return value
+
+
+def _reject_nulls(payload, required: tuple[str, ...]) -> None:
+    for field in required:
+        if field in payload.model_fields_set and getattr(payload, field) is None:
+            raise HTTPException(422, f"{field} cannot be null")
+
+
+async def _validate_plan_links(
+    session, *, requirement_id, target_asset_id, asset_data_source_id,
+    status: str, notes: Optional[str], data_source: str,
+) -> None:
+    for model, value, label in (
+        (CollectionRequirement, requirement_id, "requirement_id"),
+        (Asset, target_asset_id, "target_asset_id"),
+    ):
+        if value is not None:
+            found = (await session.execute(select(model.id).where(model.id == value))).scalar_one_or_none()
+            if found is None:
+                raise HTTPException(422, f"unknown {label}")
+    source = None
+    if asset_data_source_id is not None:
+        source = (await session.execute(
+            select(AssetDataSource).where(AssetDataSource.id == asset_data_source_id).with_for_update()
+        )).scalar_one_or_none()
+        if source is None:
+            raise HTTPException(422, "unknown asset_data_source_id")
+        if target_asset_id is None or source.asset_id != target_asset_id:
+            raise HTTPException(422, "collection source must belong to the target asset")
+        mapping = normalize_source_fields({
+            "attack_data_source": source.attack_data_source,
+            "attack_data_component": source.attack_data_component,
+        })
+        actual = mapping["attack_data_source"]
+        if actual and mapping["attack_data_component"]:
+            actual = f"{actual}: {mapping['attack_data_component']}"
+        # Unmapped collection labels can match their explicit source name.
+        actual = actual or source.name
+        if actual.strip().casefold() != data_source.strip().casefold():
+            raise HTTPException(422, "linked collection source does not match the plan data_source")
+    if status in {"collected", "validated"}:
+        if source is None or not source.enabled:
+            raise HTTPException(422, "collected/validated plan items require an enabled collection source on the target asset")
+    if status == "validated" and not (notes or "").strip():
+        raise HTTPException(422, "validated plan items require test evidence in notes")
 
 
 def _parse_kind(s: str) -> DenominatorKind:
@@ -78,6 +124,16 @@ class RequirementCreate(BaseModel):
     attack_technique_ids: list[str] = Field(default_factory=list)
     apt_group_id: Optional[str] = Field(default=None, max_length=20)
 
+    @field_validator("title")
+    @classmethod
+    def nonblank_title(cls, value):
+        if value is None:
+            return value
+        value = value.strip()
+        if not value:
+            raise ValueError("title cannot be blank")
+        return value
+
 
 class RequirementPatch(BaseModel):
     title: Optional[str] = Field(default=None, min_length=1, max_length=200)
@@ -87,6 +143,16 @@ class RequirementPatch(BaseModel):
     status: Optional[str] = None
     attack_technique_ids: Optional[list[str]] = None
     apt_group_id: Optional[str] = Field(default=None, max_length=20)
+
+    @field_validator("title")
+    @classmethod
+    def nonblank_title(cls, value):
+        if value is None:
+            return value
+        value = value.strip()
+        if not value:
+            raise ValueError("title cannot be blank")
+        return value
 
 
 def _req_out(r: CollectionRequirement, plan_count: int) -> RequirementOut:
@@ -165,6 +231,7 @@ async def update_requirement(
     _: TenantPrincipal = Depends(require_perm(Permission.ASSET_WRITE)),
     __: TenantPrincipal = Depends(require_active_customer()),
 ) -> RequirementOut:
+    _reject_nulls(payload, ("title", "driver", "priority", "status", "attack_technique_ids"))
     if payload.driver is not None:
         _validate(payload.driver, _DRIVERS, "driver")
     if payload.priority is not None:
@@ -223,6 +290,7 @@ class PlanItemOut(BaseModel):
     requirement_title: Optional[str]
     target_asset_id: Optional[str]
     target_asset_name: Optional[str]
+    asset_data_source_id: Optional[str]
     priority: str
     status: str
     assigned_to: Optional[str]
@@ -241,11 +309,22 @@ class PlanItemCreate(BaseModel):
     rationale: Optional[str] = None
     requirement_id: Optional[uuid.UUID] = None
     target_asset_id: Optional[uuid.UUID] = None
+    asset_data_source_id: Optional[uuid.UUID] = None
     priority: str = "medium"
     status: str = "proposed"
     assigned_to: Optional[str] = Field(default=None, max_length=200)
     due_date: Optional[date] = None
     notes: Optional[str] = None
+
+    @field_validator("data_source")
+    @classmethod
+    def nonblank_data_source(cls, value):
+        if value is None:
+            return value
+        value = value.strip()
+        if not value:
+            raise ValueError("data_source cannot be blank")
+        return value
 
 
 class PlanItemPatch(BaseModel):
@@ -254,11 +333,22 @@ class PlanItemPatch(BaseModel):
     rationale: Optional[str] = None
     requirement_id: Optional[uuid.UUID] = None
     target_asset_id: Optional[uuid.UUID] = None
+    asset_data_source_id: Optional[uuid.UUID] = None
     priority: Optional[str] = None
     status: Optional[str] = None
     assigned_to: Optional[str] = Field(default=None, max_length=200)
     due_date: Optional[date] = None
     notes: Optional[str] = None
+
+    @field_validator("data_source")
+    @classmethod
+    def nonblank_data_source(cls, value):
+        if value is None:
+            return value
+        value = value.strip()
+        if not value:
+            raise ValueError("data_source cannot be blank")
+        return value
 
 
 class SeedFromGapsRequest(BaseModel):
@@ -288,6 +378,7 @@ def _plan_out(
         requirement_title=req_title,
         target_asset_id=str(item.target_asset_id) if item.target_asset_id else None,
         target_asset_name=asset_name,
+        asset_data_source_id=str(item.asset_data_source_id) if item.asset_data_source_id else None,
         priority=item.priority,
         status=item.status,
         assigned_to=item.assigned_to,
@@ -357,6 +448,12 @@ async def create_plan_item(
     _validate(payload.priority, _PRIORITIES, "priority")
     _validate(payload.status, _PLAN_STATUSES, "status")
     async with tenant_session() as session:
+        await _validate_plan_links(
+            session, requirement_id=payload.requirement_id,
+            target_asset_id=payload.target_asset_id,
+            asset_data_source_id=payload.asset_data_source_id,
+            status=payload.status, notes=payload.notes, data_source=payload.data_source,
+        )
         item = CollectionPlanItem(
             id=uuid.uuid4(),
             data_source=payload.data_source.strip(),
@@ -364,6 +461,7 @@ async def create_plan_item(
             rationale=payload.rationale,
             requirement_id=payload.requirement_id,
             target_asset_id=payload.target_asset_id,
+            asset_data_source_id=payload.asset_data_source_id,
             priority=payload.priority,
             status=payload.status,
             assigned_to=payload.assigned_to,
@@ -387,6 +485,7 @@ async def update_plan_item(
     _: TenantPrincipal = Depends(require_perm(Permission.ASSET_WRITE)),
     __: TenantPrincipal = Depends(require_active_customer()),
 ) -> PlanItemOut:
+    _reject_nulls(payload, ("data_source", "priority", "status"))
     if payload.priority is not None:
         _validate(payload.priority, _PRIORITIES, "priority")
     if payload.status is not None:
@@ -399,7 +498,17 @@ async def update_plan_item(
         ).scalar_one_or_none()
         if item is None:
             raise HTTPException(404, "plan item not found")
-        for field, value in payload.model_dump(exclude_unset=True).items():
+        changes = payload.model_dump(exclude_unset=True)
+        await _validate_plan_links(
+            session,
+            requirement_id=changes.get("requirement_id", item.requirement_id),
+            target_asset_id=changes.get("target_asset_id", item.target_asset_id),
+            asset_data_source_id=changes.get("asset_data_source_id", item.asset_data_source_id),
+            status=changes.get("status", item.status),
+            notes=changes.get("notes", item.notes),
+            data_source=changes.get("data_source", item.data_source),
+        )
+        for field, value in changes.items():
             setattr(item, field, value)
         await session.flush()
         items = await _load_plan(session)

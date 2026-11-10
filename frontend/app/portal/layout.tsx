@@ -60,6 +60,7 @@ const PORTAL_NAV: NavGroup[] = [
     heading: 'Posture',
     items: [
       { label: 'Overview', href: '/portal', icon: <GridViewRoundedIcon fontSize="small" /> },
+      { label: 'Collection management', href: '/portal/cmf', icon: <LibraryBooksRoundedIcon fontSize="small" /> },
       { label: 'Coverage Matrix', href: '/portal/coverage', icon: <GridOnRoundedIcon fontSize="small" /> },
       { label: 'APT Coverage', href: '/portal/apt', icon: <GroupsRoundedIcon fontSize="small" /> },
       { label: 'Gap Analysis', href: '/portal/gaps', icon: <ReportProblemRoundedIcon fontSize="small" /> },

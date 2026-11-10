@@ -13,6 +13,7 @@ from app.api import assets as assets_router
 from app.api import auth as auth_router
 from app.api import catalog as catalog_router
 from app.api import cmf as cmf_router
+from app.api import cmf_io as cmf_io_router
 from app.api import cmf_plan as cmf_plan_router
 from app.api import connectors as connectors_router
 from app.api import coverage as coverage_router
@@ -102,6 +103,7 @@ app.include_router(saved_views_router.router)
 app.include_router(roles_router.router)
 app.include_router(assets_router.router)
 app.include_router(cmf_router.router)
+app.include_router(cmf_io_router.router)
 app.include_router(cmf_plan_router.router)
 app.include_router(diagrams_router.router)
 app.include_router(verified_router.router)

@@ -1,4 +1,5 @@
 'use client';
+import { apiErrorMessage, splitAttackDataSource, formatAttackDataSource, validRetention } from '@/lib/cmf-utils';
 
 // Customer profile tab content: asset inventory + emergency contacts.
 //
@@ -1376,6 +1377,8 @@ function DataSourceEditor({
   const [logSource, setLogSource] = useState('');
   const [description, setDescription] = useState('');
   const [storageLocation, setStorageLocation] = useState('');
+  const [killChainPhase, setKillChainPhase] = useState('');
+  const [followOnCollection, setFollowOnCollection] = useState('');
   const [retentionDays, setRetentionDays] = useState('');
   const [quality, setQuality] = useState<Record<string, number | null>>({});
   const [enabled, setEnabled] = useState(true);
@@ -1387,16 +1390,12 @@ function DataSourceEditor({
     if (!open) return;
     if (existing) {
       setName(existing.name);
-      setAttackRaw(
-        existing.attack_data_source
-          ? existing.attack_data_component
-            ? `${existing.attack_data_source}: ${existing.attack_data_component}`
-            : existing.attack_data_source
-          : '',
-      );
+      setAttackRaw(formatAttackDataSource(existing.attack_data_source, existing.attack_data_component));
       setLogSource(existing.log_source ?? '');
       setDescription(existing.description ?? '');
       setStorageLocation(existing.storage_location ?? '');
+      setKillChainPhase(existing.kill_chain_phase ?? '');
+      setFollowOnCollection(existing.follow_on_collection ?? '');
       setRetentionDays(existing.retention_days === null ? '' : String(existing.retention_days));
       setQuality(
         Object.fromEntries(QUALITY_DIMS.map((q) => [q.key, existing[q.key] as number | null])),
@@ -1409,6 +1408,8 @@ function DataSourceEditor({
       setLogSource('');
       setDescription('');
       setStorageLocation('');
+      setKillChainPhase('');
+      setFollowOnCollection('');
       setRetentionDays('');
       setQuality({});
       setEnabled(true);
@@ -1420,17 +1421,20 @@ function DataSourceEditor({
   async function save() {
     setSaving(true);
     setError(null);
-    // Split "Source: Component" on the first colon; component is optional.
-    const colon = attackRaw.indexOf(':');
-    const src = (colon >= 0 ? attackRaw.slice(0, colon) : attackRaw).trim();
-    const comp = colon >= 0 ? attackRaw.slice(colon + 1).trim() : '';
+    if (!validRetention(retentionDays === '' ? null : Number(retentionDays))) {
+      setError('Retention must be a whole number of days, zero or greater.');
+      setSaving(false);
+      return;
+    }
+    const mapping = splitAttackDataSource(attackRaw);
     const payload: AssetDataSourceInput = {
       name: name.trim(),
-      attack_data_source: src || null,
-      attack_data_component: comp || null,
+      ...mapping,
       log_source: logSource || null,
       description: description || null,
       storage_location: storageLocation || null,
+      kill_chain_phase: killChainPhase || null,
+      follow_on_collection: followOnCollection || null,
       retention_days: retentionDays === '' ? null : Number(retentionDays),
       device_completeness_q: quality.device_completeness_q ?? null,
       data_field_completeness_q: quality.data_field_completeness_q ?? null,
@@ -1448,8 +1452,7 @@ function DataSourceEditor({
       }
       onSaved();
     } catch (e: any) {
-      const detail = e?.response?.data?.detail;
-      setError(typeof detail === 'string' ? detail : 'save failed');
+      setError(apiErrorMessage(e, 'Save failed.'));
     } finally {
       setSaving(false);
     }
@@ -1507,9 +1510,13 @@ function DataSourceEditor({
               value={retentionDays}
               onChange={(e) => setRetentionDays(e.target.value)}
               sx={{ width: 140 }}
-              inputProps={{ min: 0 }}
+              inputProps={{ min: 0, step: 1 }}
             />
           </Stack>
+          <TextField size="small" label="Kill chain phase" value={killChainPhase}
+            onChange={(e) => setKillChainPhase(e.target.value)} />
+          <TextField size="small" label="Follow-on collection" multiline minRows={2}
+            value={followOnCollection} onChange={(e) => setFollowOnCollection(e.target.value)} />
           <Typography variant="overline" sx={{ color: 'text.secondary', fontWeight: 700 }}>
             DeTT&amp;CT data quality (0–5)
           </Typography>

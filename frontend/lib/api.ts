@@ -316,6 +316,8 @@ export interface AssetDataSourceOut {
   description: string | null;
   storage_connector_id: string | null;
   storage_location: string | null;
+  kill_chain_phase: string | null;
+  follow_on_collection: string | null;
   retention_days: number | null;
   device_completeness_q: number | null;
   data_field_completeness_q: number | null;
@@ -823,6 +825,7 @@ export type CmfRequirementInput = Partial<
 >;
 
 export interface CmfPlanItem {
+  asset_data_source_id: string | null;
   id: string;
   data_source: string;
   title: string | null;
@@ -851,6 +854,7 @@ export type CmfPlanItemInput = Partial<
     | 'rationale'
     | 'requirement_id'
     | 'target_asset_id'
+    | 'asset_data_source_id'
     | 'priority'
     | 'status'
     | 'assigned_to'

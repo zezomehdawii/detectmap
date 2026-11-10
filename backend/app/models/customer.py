@@ -644,6 +644,8 @@ class AssetDataSource(CustomerBase):
         String(200), comment="Sigma-style logsource, e.g. windows/security."
     )
     description: Mapped[Optional[str]] = mapped_column(Text)
+    kill_chain_phase: Mapped[Optional[str]] = mapped_column(Text)
+    follow_on_collection: Mapped[Optional[str]] = mapped_column(Text)
 
     # Where / how long it's stored
     storage_connector_id: Mapped[Optional[uuid.UUID]] = mapped_column(
@@ -818,6 +820,12 @@ class CollectionPlanItem(CustomerBase):
     )
     priority: Mapped[str] = mapped_column(
         String(12), default="medium", server_default="medium", nullable=False, index=True
+    )
+    # Actual implemented source; status alone never establishes collection.
+    asset_data_source_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("asset_data_sources.id", ondelete="SET NULL"),
+        index=True,
     )
     # proposed | approved | in_progress | collected | validated | deferred
     status: Mapped[str] = mapped_column(

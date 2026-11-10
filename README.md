@@ -32,6 +32,7 @@ sits on top of them.
 | **Reports** | Branded executive PDF (with D3FEND defenses table), ATT&CK Navigator layer JSON, Sigma rule pack export, JSON / CSV / XLSX. |
 | **Connectors** | Splunk / Sentinel / Elastic CRUD; Fernet-encrypted secrets; live read-only ping per connector kind; ingest of *deployed* use-cases for posture verification. |
 | **Settings** | AI authoring config, scheduled-refresh toggles (with run history), product branding, MSSP-portal user management, per-customer feature toggles, per-customer user management. |
+| **Collection management** | Requirements, collection plans, implemented-source links, validation notes, retention and data-quality inventory, ATT&CK visibility, JSON/CSV submissions, and tenant-pinned student access at `/portal/cmf`. See [CMF classroom setup](docs/CMF_CLASSROOM.md). |
 | **Customer profile** | Per-tenant assets (with criticality + compliance scope), asset↔detection linkage (search-and-multi-select picker), network/topology diagrams (image / PDF inline preview · binary download), emergency contacts. Read-only mirror at `/portal/organization` for customer users. |
 
 ---
@@ -77,14 +78,15 @@ python3 setup.py
 The installer walks the operator through:
 
 1. **Hostname / IP** (used for both CORS allow-list and the frontend's API base URL).
-2. **Listen port.**
+2. **Listen port.** For HTTP mode, choose **3000** to match the base Compose mapping. TLS mode uses the selected port through its overlay.
 3. **TLS mode** — *none* (HTTP), *self-signed* (generated on the fly via `cryptography`), or *bring-your-own certificate* (drop `cert.pem` + `key.pem` into `./tls/`).
 4. **Generates `.env`** with strong secrets (`JWT_TENANT_SECRET`, `JWT_SUPERADMIN_SECRET`, `FERNET_KEY`, `INTERNAL_API_KEY`).
 5. **Brings the stack up** with `docker compose up --build -d`, layering in `docker-compose.tls.yml` (Caddy reverse proxy) when TLS is selected.
 6. **Factory-resets** to a single-admin clean slate. A random initial password is generated, printed to the terminal **once**, and `must_change_password=True` is set — the admin is forced through `/change-password` on first login.
 
-Re-running is safe: `python3 setup.py --skip-reset` keeps existing data,
-`--reset` forces the wipe.
+For an existing deployment, use `python3 setup.py --keep-env --skip-reset`
+to retain both the existing environment/keys and data. `--skip-reset` alone
+still regenerates `.env`. Use `--reset` only for an intentional factory reset.
 
 ### Manual path (CI / scripted)
 
@@ -248,9 +250,10 @@ under each toggle.
 docker compose exec backend pytest -q
 ```
 
-Default suite (`262 passed, 3 skipped` as of this drop) is
-non-destructive — destructive tests are marked `wipes_db` and excluded
-by `pytest.ini`'s `addopts = -m "not wipes_db"`.
+Run endpoint and integration tests only against a disposable test database.
+Some fixtures delete shared tenant/reference records. Although `pytest.ini`
+excludes tests marked `wipes_db` by default, that filter does not guarantee
+that the remaining suite leaves existing data untouched.
 
 Run the destructive set explicitly with:
 
@@ -265,6 +268,31 @@ The pragmatic Sigma matcher has its own marker (`matcher`, 25 unit
 tests, no DB). Customer-profile tests cover assets CRUD + linkage + RBAC
 (18 tests), diagrams upload/list/download/RBAC/single-primary invariant
 + file-on-disk cleanup (12 tests).
+
+---
+
+## CMF classroom and student portal
+
+Use [the classroom setup guide](docs/CMF_CLASSROOM.md) for tenant migration,
+dedicated student accounts, synthetic ICS starter data, source validation,
+JSON/CSV submissions, and scoped starter restoration.
+
+MSSP users work at `/dashboard/cmf`. Students sign in using a `customer_user`
+account assigned to one customer and open `/portal/cmf`. Create these users
+under **Customers → select customer → Users**. Each student/team should have
+its own customer so its collection inventory and plan remain separate.
+
+Existing tenants must apply migration `0013_cmf_validation_fields`; restarting
+the containers alone does not apply customer migrations. The guide includes
+an explicit upgrade command that preserves the current inventory and accounts.
+
+CMF integration tests in `tests/test_cmf_classroom_integration.py` run only
+against the explicitly isolated `localhost:15432/cmf_test` database. They
+skip elsewhere. Pure submission/starter-data tests can run with:
+
+```bash
+docker compose exec backend pytest --confcutdir=tests/cmf_unit tests/cmf_unit -q
+```
 
 ---
 

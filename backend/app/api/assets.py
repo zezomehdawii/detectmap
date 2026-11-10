@@ -16,7 +16,7 @@ from datetime import datetime
 from typing import Optional
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, Response
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from sqlalchemy import and_, delete, func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError
@@ -29,10 +29,13 @@ from app.models.customer import (
     AssetDataSource,
     AssetDetection,
     Connector,
+    CollectionPlanItem,
     CustomerContact,
     Detection,
     DetectionTechnique,
 )
+
+from app.services.cmf_sources import normalize_source_fields, source_patch_changes, material_source_changes
 
 router = APIRouter(prefix="", tags=["customer-profile"])
 
@@ -481,6 +484,10 @@ async def delete_asset(
         ).scalar_one_or_none()
         if row is None:
             raise HTTPException(404, "asset not found")
+        source_ids = list((await session.execute(
+            select(AssetDataSource.id).where(AssetDataSource.asset_id == asset_id)
+        )).scalars().all())
+        await _invalidate_source_plans(session, source_ids, "target asset and its collection sources deleted")
         await session.delete(row)
     return Response(status_code=204)
 
@@ -668,6 +675,8 @@ class AssetDataSourceOut(BaseModel):
     attack_data_component: Optional[str]
     log_source: Optional[str]
     description: Optional[str]
+    kill_chain_phase: Optional[str]
+    follow_on_collection: Optional[str]
     storage_connector_id: Optional[str]
     storage_location: Optional[str]
     retention_days: Optional[int]
@@ -690,34 +699,48 @@ class AssetDataSourceCreate(BaseModel):
     attack_data_component: Optional[str] = Field(default=None, max_length=120)
     log_source: Optional[str] = Field(default=None, max_length=200)
     description: Optional[str] = None
+    kill_chain_phase: Optional[str] = None
+    follow_on_collection: Optional[str] = None
     storage_connector_id: Optional[uuid.UUID] = None
     storage_location: Optional[str] = Field(default=None, max_length=200)
-    retention_days: Optional[int] = Field(default=None, ge=0)
-    device_completeness_q: Optional[int] = None
-    data_field_completeness_q: Optional[int] = None
-    timeliness_q: Optional[int] = None
-    consistency_q: Optional[int] = None
-    retention_q: Optional[int] = None
+    retention_days: Optional[int] = Field(default=None, ge=0, strict=True)
+    device_completeness_q: Optional[int] = Field(default=None, ge=0, le=5, strict=True)
+    data_field_completeness_q: Optional[int] = Field(default=None, ge=0, le=5, strict=True)
+    timeliness_q: Optional[int] = Field(default=None, ge=0, le=5, strict=True)
+    consistency_q: Optional[int] = Field(default=None, ge=0, le=5, strict=True)
+    retention_q: Optional[int] = Field(default=None, ge=0, le=5, strict=True)
     enabled: bool = True
     notes: Optional[str] = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def canonical_mapping(cls, values):
+        return normalize_source_fields(values) if isinstance(values, dict) else values
 
 
 class AssetDataSourcePatch(BaseModel):
     name: Optional[str] = Field(default=None, min_length=1, max_length=200)
-    attack_data_source: Optional[str] = None
-    attack_data_component: Optional[str] = None
-    log_source: Optional[str] = None
+    attack_data_source: Optional[str] = Field(default=None, max_length=120)
+    attack_data_component: Optional[str] = Field(default=None, max_length=120)
+    log_source: Optional[str] = Field(default=None, max_length=200)
     description: Optional[str] = None
+    kill_chain_phase: Optional[str] = None
+    follow_on_collection: Optional[str] = None
     storage_connector_id: Optional[uuid.UUID] = None
-    storage_location: Optional[str] = None
-    retention_days: Optional[int] = Field(default=None, ge=0)
-    device_completeness_q: Optional[int] = None
-    data_field_completeness_q: Optional[int] = None
-    timeliness_q: Optional[int] = None
-    consistency_q: Optional[int] = None
-    retention_q: Optional[int] = None
+    storage_location: Optional[str] = Field(default=None, max_length=200)
+    retention_days: Optional[int] = Field(default=None, ge=0, strict=True)
+    device_completeness_q: Optional[int] = Field(default=None, ge=0, le=5, strict=True)
+    data_field_completeness_q: Optional[int] = Field(default=None, ge=0, le=5, strict=True)
+    timeliness_q: Optional[int] = Field(default=None, ge=0, le=5, strict=True)
+    consistency_q: Optional[int] = Field(default=None, ge=0, le=5, strict=True)
+    retention_q: Optional[int] = Field(default=None, ge=0, le=5, strict=True)
     enabled: Optional[bool] = None
     notes: Optional[str] = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def canonical_mapping(cls, values):
+        return normalize_source_fields(values) if isinstance(values, dict) else values
 
 
 def _serialise_data_source(d: AssetDataSource) -> AssetDataSourceOut:
@@ -729,6 +752,8 @@ def _serialise_data_source(d: AssetDataSource) -> AssetDataSourceOut:
         attack_data_component=d.attack_data_component,
         log_source=d.log_source,
         description=d.description,
+        kill_chain_phase=d.kill_chain_phase,
+        follow_on_collection=d.follow_on_collection,
         storage_connector_id=str(d.storage_connector_id) if d.storage_connector_id else None,
         storage_location=d.storage_location,
         retention_days=d.retention_days,
@@ -750,6 +775,31 @@ def _validate_data_source_quality(payload) -> None:
     """Validate the five DeTT&CT quality dimensions on a create/patch body."""
     for field in _QUALITY_FIELDS:
         _validate_quality(getattr(payload, field), field)
+    if "name" in payload.model_fields_set and payload.name is not None and not payload.name.strip():
+        raise HTTPException(422, "name cannot be blank")
+    if isinstance(payload, AssetDataSourceCreate) and payload.attack_data_component and not payload.attack_data_source:
+        raise HTTPException(422, "attack_data_component requires attack_data_source")
+
+
+async def _invalidate_source_plans(session, source_ids: list[uuid.UUID], reason: str) -> int:
+    """Require retesting completed plans when their actual collection changes.
+
+    Runs in the same tenant transaction as the source mutation. Prior evidence
+    stays in notes; only linked collected/validated plans return to in_progress.
+    """
+    if not source_ids:
+        return 0
+    plans = (await session.execute(
+        select(CollectionPlanItem).where(
+            CollectionPlanItem.asset_data_source_id.in_(source_ids),
+            CollectionPlanItem.status.in_(("collected", "validated")),
+        )
+    )).scalars().all()
+    for plan in plans:
+        plan.status = "in_progress"
+        notice = f"Revalidation required: {reason}. Previous test evidence retained above."
+        plan.notes = f"{plan.notes}\n\n{notice}" if plan.notes else notice
+    return len(plans)
 
 
 async def _assert_asset_exists(session, asset_id: uuid.UUID) -> None:
@@ -818,6 +868,8 @@ async def create_asset_data_source(
             attack_data_component=payload.attack_data_component,
             log_source=payload.log_source,
             description=payload.description,
+            kill_chain_phase=payload.kill_chain_phase,
+            follow_on_collection=payload.follow_on_collection,
             storage_connector_id=payload.storage_connector_id,
             storage_location=payload.storage_location,
             retention_days=payload.retention_days,
@@ -860,22 +912,24 @@ async def patch_asset_data_source(
                 select(AssetDataSource).where(
                     AssetDataSource.id == ds_id,
                     AssetDataSource.asset_id == asset_id,
-                )
+                ).with_for_update()
             )
         ).scalar_one_or_none()
         if row is None:
             raise HTTPException(404, "data source not found")
         if payload.storage_connector_id is not None:
             await _assert_connector_exists(session, payload.storage_connector_id)
-        for field in (
-            "name", "attack_data_source", "attack_data_component", "log_source",
-            "description", "storage_connector_id", "storage_location",
-            "retention_days", "device_completeness_q", "data_field_completeness_q",
-            "timeliness_q", "consistency_q", "retention_q", "enabled", "notes",
-        ):
-            v = getattr(payload, field)
-            if v is not None:
-                setattr(row, field, v.strip() if field == "name" else v)
+        try:
+            changes = source_patch_changes(payload, row)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+        material = material_source_changes(changes, row)
+        if material:
+            await _invalidate_source_plans(
+                session, [row.id], f"collection source changed ({', '.join(material)})",
+            )
+        for field, value in changes.items():
+            setattr(row, field, value)
         row.updated_by_email = principal.user.email
         try:
             await session.flush()
@@ -902,11 +956,12 @@ async def delete_asset_data_source(
                 select(AssetDataSource).where(
                     AssetDataSource.id == ds_id,
                     AssetDataSource.asset_id == asset_id,
-                )
+                ).with_for_update()
             )
         ).scalar_one_or_none()
         if row is None:
             raise HTTPException(404, "data source not found")
+        await _invalidate_source_plans(session, [row.id], "collection source deleted")
         await session.delete(row)
     return Response(status_code=204)
 
@@ -1065,6 +1120,8 @@ async def import_assets(
                         attack_data_component=ds.attack_data_component,
                         log_source=ds.log_source,
                         description=ds.description,
+                        kill_chain_phase=ds.kill_chain_phase,
+                        follow_on_collection=ds.follow_on_collection,
                         storage_connector_id=ds.storage_connector_id,
                         storage_location=ds.storage_location,
                         retention_days=ds.retention_days,
