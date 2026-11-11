@@ -101,6 +101,7 @@ import {
   updateDiagram,
   uploadDiagram,
 } from '@/lib/api';
+import AssetDiscovery from '../_components/AssetDiscovery';
 
 const CRITICALITY_COLOR: Record<string, 'default' | 'success' | 'warning' | 'error'> = {
   low: 'default',
@@ -116,7 +117,7 @@ export default function ProfileTab({ customer }: { customer: CustomerOut }) {
 
   return (
     <Stack spacing={4}>
-      <AssetsSection codename={codename} archived={archived} />
+      <AssetsSection codename={codename} status={customer.status} />
       <Divider />
       <DiagramsSection codename={codename} archived={archived} />
       <Divider />
@@ -127,7 +128,8 @@ export default function ProfileTab({ customer }: { customer: CustomerOut }) {
 
 // ---- Assets --------------------------------------------------------------
 
-function AssetsSection({ codename, archived }: { codename: string; archived: boolean }) {
+function AssetsSection({ codename, status }: { codename: string; status: string }) {
+  const archived = status === 'archived';
   const [items, setItems] = useState<AssetOut[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -170,8 +172,8 @@ function AssetsSection({ codename, archived }: { codename: string; archived: boo
 
   return (
     <Box>
-      <Stack direction="row" alignItems="center" spacing={1} mb={1.5}>
-        <Box sx={{ flex: 1 }}>
+      <Stack direction="row" alignItems="center" spacing={1} mb={1.5} flexWrap="wrap" useFlexGap>
+        <Box sx={{ flex: 1, minWidth: 200 }}>
           <Typography variant="overline" sx={{ fontWeight: 700, color: 'text.secondary' }}>
             Collection Management Framework ({items.length})
           </Typography>
@@ -190,6 +192,7 @@ function AssetsSection({ codename, archived }: { codename: string; archived: boo
             variant="outlined"
           />
         )}
+        <AssetDiscovery customer={codename} disabled={status !== 'active'} onImported={reload} />
         <Button
           size="small"
           variant="outlined"

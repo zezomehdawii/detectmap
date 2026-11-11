@@ -16,6 +16,7 @@ from sqlalchemy import select
 
 from app.api.deps import TenantPrincipal, current_tenant_user
 from app.config import settings
+from app.core.rbac import Permission
 from app.core.security import (
     TokenAudience,
     create_access_token,
@@ -26,6 +27,7 @@ from app.db.base import AsyncSessionLocal
 from app.models.public import AppSettings, Customer, MSSPOrg, Role, SuperAdmin, User
 from app.services import customer_features
 from app.services.deployment import load_scope
+from app.services.roles import user_has_permission
 
 log = logging.getLogger(__name__)
 
@@ -132,6 +134,7 @@ class MeResponse(BaseModel):
     customer_name: str | None
     mssp_org_id: str | None
     must_change_password: bool = False
+    can_write_assets: bool = False
 
 
 class LoginHintOut(BaseModel):
@@ -293,6 +296,7 @@ async def me(principal: TenantPrincipal = Depends(current_tenant_user)) -> MeRes
             str(principal.user.mssp_org_id) if principal.user.mssp_org_id else None
         ),
         must_change_password=principal.user.must_change_password,
+        can_write_assets=await user_has_permission(principal.user, Permission.ASSET_WRITE),
     )
 
 

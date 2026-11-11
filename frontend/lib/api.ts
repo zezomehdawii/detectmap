@@ -163,6 +163,7 @@ export interface MeResponse {
   customer_name: string | null;
   mssp_org_id: string | null;
   must_change_password: boolean;
+  can_write_assets?: boolean;
 }
 
 export interface LoginResponse {
@@ -374,6 +375,36 @@ export interface AssetImportResult {
   errors: { row: number; name?: string; error: unknown }[];
 }
 
+export interface CaptureEndpoint {
+  ip_address: string;
+  mac_addresses: string[];
+  protocols: string[];
+  packet_count: number;
+  suggested_name: string;
+  suggested_kind: 'other';
+  existing_asset_id: string | null;
+  existing_asset_name: string | null;
+}
+
+export interface CapturePreview {
+  packet_count: number;
+  truncated: boolean;
+  warnings: string[];
+  endpoints: CaptureEndpoint[];
+}
+
+export interface CaptureImportRow {
+  ip_address: string;
+  name: string;
+  kind: string;
+}
+
+export interface CaptureImportResult {
+  created: number;
+  skipped: number;
+  assets: { id: string; name: string; ip_address: string }[];
+}
+
 export interface AssetDetectionRef {
   detection_id: string;
   sigma_id: string;
@@ -400,6 +431,21 @@ export interface AssetFilters {
 // Helper: build axios config with an optional X-Customer override.
 function _cust(customer?: string): { headers?: Record<string, string> } {
   return customer ? { headers: { 'X-Customer': customer } } : {};
+}
+
+export async function previewCaptureAssets(file: File, customer?: string): Promise<CapturePreview> {
+  const form = new FormData();
+  form.append('file', file);
+  const { data } = await api.post<CapturePreview>('/assets/pcap/preview', form, {
+    ..._cust(customer),
+    timeout: 180_000,
+  });
+  return data;
+}
+
+export async function importCaptureAssets(rows: CaptureImportRow[], customer?: string): Promise<CaptureImportResult> {
+  const { data } = await api.post<CaptureImportResult>('/assets/pcap/import', { rows }, _cust(customer));
+  return data;
 }
 
 export async function listAssets(

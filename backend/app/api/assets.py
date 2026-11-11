@@ -15,11 +15,16 @@ import uuid
 from datetime import datetime
 from typing import Optional
 
-from fastapi import APIRouter, Body, Depends, HTTPException, Query, Response
-from pydantic import BaseModel, Field, model_validator
-from sqlalchemy import and_, delete, func, select
+from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request, Response
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from python_multipart.exceptions import MultipartParseError
+from sqlalchemy import and_, delete, func, select, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError
+from starlette.concurrency import run_in_threadpool
+from starlette.datastructures import UploadFile
+from starlette.formparsers import MultiPartException, MultiPartParser
+from starlette.requests import ClientDisconnect
 
 from app.api.deps import TenantPrincipal, require_active_customer, require_perm
 from app.core.rbac import Permission
@@ -34,7 +39,9 @@ from app.models.customer import (
     Detection,
     DetectionTechnique,
 )
+from app.models.public import CustomerStatus
 
+from app.services import capture_discovery
 from app.services.cmf_sources import normalize_source_fields, source_patch_changes, material_source_changes
 
 router = APIRouter(prefix="", tags=["customer-profile"])
@@ -364,32 +371,249 @@ async def create_asset(
     compliance = _validate_compliance(payload.compliance_scope)
 
     async with tenant_session() as session:
-        asset = Asset(
-            id=uuid.uuid4(),
-            name=payload.name.strip(),
-            kind=payload.kind,
-            hostname=payload.hostname,
-            ip_address=payload.ip_address,
-            os=payload.os,
-            environment=payload.environment,
-            location=payload.location,
-            owner=payload.owner,
-            business_function=payload.business_function,
-            cmf_category=payload.cmf_category or None,
-            criticality=payload.criticality,
-            data_classification=payload.data_classification or None,
-            compliance_scope=compliance,
-            status=payload.status,
-            tags=list(payload.tags or []),
-            notes=payload.notes,
-            external_id=payload.external_id,
-            created_by_email=principal.user.email,
-            updated_by_email=principal.user.email,
-        )
+        asset = _new_asset(payload, compliance, principal.user.email)
         session.add(asset)
         await session.flush()
         coverage = await _coverage_for_assets(session, [asset.id])
         return _serialise_asset(asset, coverage[asset.id], 0)
+
+
+def _new_asset(payload: AssetCreate, compliance: list[str], email: str) -> Asset:
+    values = payload.model_dump()
+    values.update(
+        name=payload.name.strip(),
+        cmf_category=payload.cmf_category or None,
+        data_classification=payload.data_classification or None,
+        compliance_scope=compliance,
+        created_by_email=email,
+        updated_by_email=email,
+    )
+    return Asset(id=uuid.uuid4(), **values)
+
+
+# ---- Packet capture discovery --------------------------------------------
+
+class CaptureEndpointOut(BaseModel):
+    ip_address: str
+    mac_addresses: list[str]
+    protocols: list[str]
+    packet_count: int
+    suggested_name: str
+    suggested_kind: str = "other"
+    existing_asset_id: str | None = None
+    existing_asset_name: str | None = None
+
+
+class CapturePreviewOut(BaseModel):
+    packet_count: int
+    truncated: bool
+    warnings: list[str]
+    endpoints: list[CaptureEndpointOut]
+
+
+class CaptureImportRow(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    ip_address: str = Field(max_length=64)
+    name: str = Field(min_length=1, max_length=200, pattern=r"^[^\x00]+$")
+    kind: str = Field(default="other", max_length=40)
+
+    @field_validator("ip_address")
+    @classmethod
+    def validate_address(cls, value: str) -> str:
+        address = capture_discovery.canonical_address(value)
+        if not capture_discovery.is_endpoint(address):
+            raise ValueError("An observed unicast IP address is required.")
+        return str(address)
+
+
+class CaptureImportRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    rows: list[CaptureImportRow] = Field(min_length=1, max_length=capture_discovery.MAX_ENDPOINTS)
+
+
+class CaptureAssetOut(BaseModel):
+    id: str
+    name: str
+    ip_address: str
+
+
+class CaptureImportOut(BaseModel):
+    created: int
+    skipped: int
+    assets: list[CaptureAssetOut]
+
+
+class _CaptureTooLarge(MultiPartException):
+    pass
+
+
+class _CaptureUploadParser(MultiPartParser):
+    """Bound multipart headers and close spooled files on malformed uploads."""
+
+    header_bytes = 0
+
+    def _count_header_bytes(self, size: int) -> None:
+        self.header_bytes += size
+        if self.header_bytes > 16384:
+            raise MultiPartException("Capture upload headers exceed 16 KiB.")
+
+    def on_header_field(self, data: bytes, start: int, end: int) -> None:
+        self._count_header_bytes(end - start)
+        super().on_header_field(data, start, end)
+
+    def on_header_value(self, data: bytes, start: int, end: int) -> None:
+        self._count_header_bytes(end - start)
+        super().on_header_value(data, start, end)
+
+    async def parse(self):
+        try:
+            return await super().parse()
+        except BaseException:
+            # Starlette closes these for MultiPartException. Do the same for
+            # parser errors, cancellation and interrupted client uploads.
+            for file in self._files_to_close_on_error:
+                file.close()
+            raise
+
+
+async def _discover_capture_upload(request: Request) -> capture_discovery.Discovery:
+    content_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+    if content_type != "multipart/form-data":
+        raise HTTPException(415, "Upload a capture as multipart form data.")
+    max_body = capture_discovery.MAX_CAPTURE_BYTES + 65536
+    content_length = request.headers.get("content-length")
+    if content_length is not None:
+        if not content_length.isascii() or not content_length.isdecimal() or len(content_length) > 12:
+            raise HTTPException(400, "Invalid content length.")
+        if int(content_length) > max_body:
+            raise HTTPException(413, "Capture exceeds the 128 MiB limit.")
+
+    async def bounded_body():
+        received = 0
+        async for chunk in request.stream():
+            received += len(chunk)
+            if received > max_body:
+                raise _CaptureTooLarge("Capture exceeds the 128 MiB limit.")
+            yield chunk
+
+    try:
+        form = await _CaptureUploadParser(request.headers, bounded_body(), max_files=1, max_fields=0).parse()
+    except _CaptureTooLarge as exc:
+        raise HTTPException(413, exc.message) from exc
+    except (MultiPartException, MultipartParseError, ClientDisconnect) as exc:
+        raise HTTPException(400, "Upload exactly one capture in the file field.") from exc
+    try:
+        file = form.get("file")
+        if not isinstance(file, UploadFile):
+            raise HTTPException(400, "Upload exactly one capture in the file field.")
+        if file.size is not None and file.size > capture_discovery.MAX_CAPTURE_BYTES:
+            raise HTTPException(413, "Capture exceeds the 128 MiB limit.")
+        return await run_in_threadpool(capture_discovery.discover, file.file)
+    except capture_discovery.CaptureError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    finally:
+        await form.close()
+
+
+async def _existing_capture_assets(session, addresses: set[str]) -> dict[str, tuple[str, str]]:
+    """Find exact normalized address matches, including pre-existing manual assets."""
+    if not addresses:
+        return {}
+    found: dict[str, tuple[str, str]] = {}
+    rows = await session.stream(
+        select(Asset.id, Asset.name, Asset.ip_address)
+        .where(Asset.ip_address.is_not(None))
+        .order_by(Asset.created_at, Asset.id)
+        .execution_options(yield_per=500)
+    )
+    try:
+        async for asset_id, name, ip in rows:
+            try:
+                address = str(capture_discovery.canonical_address(ip))
+            except ValueError:
+                continue
+            if address in addresses and address not in found:
+                found[address] = (str(asset_id), name)
+                if len(found) == len(addresses):
+                    break
+    finally:
+        await rows.close()
+    return found
+
+
+@router.post(
+    "/assets/pcap/preview",
+    response_model=CapturePreviewOut,
+    openapi_extra={"requestBody": {"required": True, "content": {
+        "multipart/form-data": {"schema": {
+            "type": "object", "required": ["file"], "properties": {"file": {"type": "string", "format": "binary"}},
+        }},
+    }}},
+)
+async def preview_asset_capture(
+    request: Request,
+    _: TenantPrincipal = Depends(require_perm(Permission.ASSET_WRITE)),
+    __: TenantPrincipal = Depends(require_active_customer()),
+) -> CapturePreviewOut:
+    if __.customer.status != CustomerStatus.ACTIVE:
+        raise HTTPException(409, "Packet capture discovery requires an active environment.")
+    discovered = await _discover_capture_upload(request)
+    async with tenant_session() as session:
+        existing = await _existing_capture_assets(session, {row.ip_address for row in discovered.endpoints})
+    endpoints = []
+    for row in discovered.endpoints:
+        asset = existing.get(row.ip_address)
+        endpoints.append(CaptureEndpointOut(
+            ip_address=row.ip_address,
+            mac_addresses=sorted(row.mac_addresses),
+            protocols=sorted(row.protocols),
+            packet_count=row.packet_count,
+            suggested_name=row.ip_address,
+            existing_asset_id=asset[0] if asset else None,
+            existing_asset_name=asset[1] if asset else None,
+        ))
+    return CapturePreviewOut(
+        packet_count=discovered.packet_count,
+        truncated=discovered.truncated,
+        warnings=discovered.warnings,
+        endpoints=endpoints,
+    )
+
+
+@router.post("/assets/pcap/import", response_model=CaptureImportOut)
+async def import_asset_capture(
+    payload: CaptureImportRequest,
+    principal: TenantPrincipal = Depends(require_perm(Permission.ASSET_WRITE)),
+    __: TenantPrincipal = Depends(require_active_customer()),
+) -> CaptureImportOut:
+    if __.customer.status != CustomerStatus.ACTIVE:
+        raise HTTPException(409, "Packet capture import requires an active environment.")
+    for row in payload.rows:
+        _validate_enum(row.kind, _ASSET_KINDS, "kind")
+    created = []
+    async with tenant_session() as session:
+        # Serialize capture imports for this workspace so repeated or
+        # concurrent imports never create another asset for the same address.
+        await session.execute(
+            text("SELECT pg_advisory_xact_lock(741225033, hashtext(:customer))"),
+            {"customer": __.customer.codename},
+        )
+        addresses = {row.ip_address for row in payload.rows}
+        seen = set(await _existing_capture_assets(session, addresses))
+        for row in payload.rows:
+            if row.ip_address in seen:
+                continue
+            asset = _new_asset(AssetCreate(
+                name=row.name, kind=row.kind, ip_address=row.ip_address, status="planned",
+                tags=["pcap-discovery"],
+                notes="Added through packet capture discovery. Verify the endpoint identity and role.",
+            ), [], principal.user.email)
+            session.add(asset)
+            created.append(CaptureAssetOut(id=str(asset.id), name=asset.name, ip_address=row.ip_address))
+            seen.add(row.ip_address)
+    return CaptureImportOut(created=len(created), skipped=len(payload.rows) - len(created), assets=created)
 
 
 @router.get("/assets/{asset_id}", response_model=AssetOut)

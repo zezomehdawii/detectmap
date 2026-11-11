@@ -68,8 +68,10 @@ import {
   listSectorProfiles,
   updateAssetDataSource,
 } from '@/lib/api';
+import { getActiveCustomer } from '@/lib/auth';
 import { apiErrorMessage, formatAttackDataSource, splitAttackDataSource, validRetention } from '@/lib/cmf-utils';
 import { coverage } from '../../theme';
+import AssetDiscovery from '../_components/AssetDiscovery';
 import { PlanTab, RequirementsTab } from './CmfLifecycle';
 
 type Kind = 'full' | 'sector' | 'apt';
@@ -570,6 +572,7 @@ interface RegisterRow extends AssetDataSourceOut {
 }
 
 export default function CmfPage() {
+  const customer = getActiveCustomer();
   const requestVersion = useRef(0);
   const registerVersion = useRef(0);
   const [planVersion, setPlanVersion] = useState(0);
@@ -628,7 +631,7 @@ export default function CmfPage() {
     const version = ++registerVersion.current;
     const a = await listAssets();
     const lists = await Promise.all(
-      a.map((asset) =>
+      a.filter((asset) => asset.data_source_count > 0).map((asset) =>
         listAssetDataSources(asset.id)
           .then((ds) => ds.map((d) => ({ ...d, asset_name: asset.name, asset_kind: asset.kind, site: asset.location }))),
       ),
@@ -985,23 +988,34 @@ export default function CmfPage() {
           {tab === 'register' && (
             <Card>
               <CardContent sx={{ p: { xs: 2, md: 2.5 } }}>
-                <Stack direction="row" justifyContent="space-between" alignItems="center" sx={{ mb: 1.5 }}>
+                <Stack direction="row" justifyContent="space-between" alignItems="center" gap={1} flexWrap="wrap" sx={{ mb: 1.5 }}>
                   <Typography variant="subtitle1" sx={{ fontWeight: 700 }}>
                     Collection register ({register.length})
                   </Typography>
-                  <Button
-                    variant="contained"
-                    size="small"
-                    startIcon={<AddRoundedIcon />}
-                    onClick={() => openAdd()}
-                    disabled={assets.length === 0}
-                  >
-                    Add data source
-                  </Button>
+                  <Stack direction="row" spacing={1} flexWrap="wrap" useFlexGap>
+                    <AssetDiscovery
+                      customer={customer ?? undefined}
+                      disabled={!customer}
+                      onImported={() => {
+                        Promise.all([loadRegister(), load()]).catch((err) => {
+                          setError(apiErrorMessage(err, 'Assets were added. Refresh the collection register to see them.'));
+                        });
+                      }}
+                    />
+                    <Button
+                      variant="contained"
+                      size="small"
+                      startIcon={<AddRoundedIcon />}
+                      onClick={() => openAdd()}
+                      disabled={assets.length === 0}
+                    >
+                      Add data source
+                    </Button>
+                  </Stack>
                 </Stack>
                 {assets.length === 0 ? (
                   <Alert severity="info">
-                    No assets yet. Ask the instructor to load the classroom inventory, or add assets in the customer profile.
+                    No assets yet. Discover assets from a capture, or ask your administrator to add them.
                   </Alert>
                 ) : (
                   <Box sx={{ overflowX: 'auto' }}><Table size="small" sx={{ minWidth: 1300 }}>
