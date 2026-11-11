@@ -113,6 +113,8 @@ class EnvironmentConfigurationTests(unittest.TestCase):
             self.assertEqual(values["DETECTMAP_LISTEN_PORT"], "8181")
             self.assertEqual(values["CORS_ORIGINS"], "http://192.0.2.25:8181")
             self.assertEqual(values["NEXT_PUBLIC_API_BASE"], "http://192.0.2.25:8000")
+            self.assertEqual(values["DEFAULT_LOGIN_EMAIL"], "admin@demo.local")
+            self.assertEqual(values["DEFAULT_LOGIN_PASSWORD"], "change-me")
             # The selected setting must actually drive the frontend mapping.
             compose = (root / "docker-compose.yml").read_text(encoding="utf-8")
             self.assertIn("${DETECTMAP_HTTP_PORT:-3000}:3000", compose)
@@ -191,12 +193,44 @@ class InteractiveSetupFlowTests(unittest.TestCase):
             self.assertEqual(values["DETECTMAP_SERVER_HOST"], "198.51.100.25")
             self.assertEqual(values["DETECTMAP_HTTP_PORT"], "8080")
             self.assertEqual(values["CORS_ORIGINS"], "http://198.51.100.25:8080")
+            self.assertEqual(values["DEFAULT_LOGIN_EMAIL"], "admin@demo.local")
+            self.assertEqual(values["DEFAULT_LOGIN_PASSWORD"], "change-me")
             self.assertIn("http://198.51.100.25:8080", calls["output"].getvalue())
             calls["runtime"].assert_called_once()
             calls["compose"].assert_called_once()
             calls["health"].assert_called_once()
             calls["initialize"].assert_called_once()
+            self.assertEqual(calls["initialize"].call_args.args[2], values["DEFAULT_LOGIN_EMAIL"])
             calls["reset"].assert_not_called()
+
+    def test_custom_fresh_admin_email_matches_the_configured_login_hint(self):
+        def answers(question, default=None):
+            return " Trainer@Example.Local " if question == "Email for the MSSP administrator" else default or ""
+
+        with isolated_project() as root, mocked_flow([], answer=answers) as calls:
+            installer.main()
+            values = env_values(root / ".env")
+            self.assertEqual(values["DEFAULT_LOGIN_EMAIL"], "trainer@example.local")
+            self.assertEqual(values["DEFAULT_LOGIN_PASSWORD"], "change-me")
+            self.assertEqual(calls["initialize"].call_args.args[2], values["DEFAULT_LOGIN_EMAIL"])
+
+    def test_rerun_keeps_configured_hint_identity_and_password_unchanged(self):
+        with isolated_project() as root:
+            seed_saved_configuration(root)
+            path = root / ".env"
+            path.write_text(path.read_text(encoding="utf-8")
+                            .replace("DEFAULT_LOGIN_EMAIL=admin@demo.local", "DEFAULT_LOGIN_EMAIL=trainer@example.local")
+                            .replace("DEFAULT_LOGIN_PASSWORD=change-me", "DEFAULT_LOGIN_PASSWORD=operator-default"), encoding="utf-8")
+            before = path.read_bytes()
+
+            def answers(question, default=None):
+                self.assertNotEqual(question, "Email for the MSSP administrator")
+                return default or ""
+
+            with mocked_flow(["--keep-env"], answer=answers) as calls:
+                installer.main()
+                self.assertEqual(path.read_bytes(), before)
+                self.assertIsNone(calls["initialize"].call_args.args[2])
 
     def test_fresh_self_signed_setup_writes_environment_before_container_certificate_step(self):
         with isolated_project() as root, mocked_flow([]) as calls:
@@ -283,7 +317,8 @@ class InteractiveSetupFlowTests(unittest.TestCase):
                 installer.main()
                 after = env_values(root / ".env")
                 for key in ["POSTGRES_PASSWORD", "JWT_TENANT_SECRET", "JWT_SUPERADMIN_SECRET",
-                            "FERNET_KEY", "INTERNAL_API_KEY", "OPERATOR_SETTING"]:
+                            "FERNET_KEY", "INTERNAL_API_KEY", "OPERATOR_SETTING",
+                            "DEFAULT_LOGIN_EMAIL", "DEFAULT_LOGIN_PASSWORD"]:
                     self.assertEqual(after[key], before[key])
                 self.assertEqual(after["DETECTMAP_TLS_MODE"], "none")
                 self.assertEqual(after["DETECTMAP_HTTP_PORT"], "8080")
@@ -328,6 +363,17 @@ class InteractiveSetupFlowTests(unittest.TestCase):
             self.assertFalse((root / ".env").exists())
             calls["compose"].assert_not_called()
             calls["initialize"].assert_not_called()
+
+
+class ResetConfigurationTests(unittest.TestCase):
+    def test_explicit_reset_requests_configured_login_defaults_without_password_arguments(self):
+        with mock.patch.object(installer, "run_compose") as compose:
+            installer.run_factory_reset(["docker", "compose"], False, "admin@demo.local", "super@detectmap.local")
+        arguments = compose.call_args.args[1]
+        self.assertIn("--use-login-defaults", arguments)
+        self.assertIn("--yes", arguments)
+        self.assertNotIn("--admin-password", arguments)
+        self.assertNotIn("--super-password", arguments)
 
 
 class CertificateCopyTests(unittest.TestCase):

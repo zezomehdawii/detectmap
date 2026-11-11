@@ -30,6 +30,8 @@ TLS_DIR = REPO_ROOT / "tls"
 CADDYFILE = TLS_DIR / "Caddyfile"
 CERT_PATH = TLS_DIR / "cert.pem"
 KEY_PATH = TLS_DIR / "key.pem"
+DEFAULT_LOGIN_EMAIL = "admin@demo.local"
+DEFAULT_LOGIN_PASSWORD = "change-me"
 
 # ---- terminal helpers ----------------------------------------------------
 
@@ -204,6 +206,7 @@ def write_env(
     tls_mode: str,
     cors_origin: str,
     api_base: str,
+    admin_email: str = DEFAULT_LOGIN_EMAIL,
 ) -> None:
     """Generate credentials for a new configuration only."""
     if ENV_PATH.exists():
@@ -240,6 +243,11 @@ INTERNAL_API_KEY={gen_secret(32)}
 APP_ENV=production
 APP_DEBUG=false
 APP_NAME=The Detection Map
+
+# Default dashboard administrator, shown on the sign-in page for the lab.
+# Hide the card under Settings -> Branding when it is no longer needed.
+DEFAULT_LOGIN_EMAIL={admin_email}
+DEFAULT_LOGIN_PASSWORD={DEFAULT_LOGIN_PASSWORD}
 
 # CORS: browsers loading the frontend must match this origin.
 CORS_ORIGINS={cors_origin}
@@ -349,16 +357,20 @@ def wait_for_backend(compose: list[str], tls: bool) -> None:
     raise RuntimeError("Backend did not become healthy; inspect docker compose logs backend and rerun setup.")
 
 
-def run_initialization(compose: list[str], tls: bool, admin_email: str, super_email: str) -> None:
-    run_compose(compose, ["exec", "-T", "backend", "python", "-m",
-                         "app.scripts.initialize_admins", "--admin-email", admin_email,
-                         "--super-email", super_email], tls=tls)
+def run_initialization(compose: list[str], tls: bool, admin_email: str | None, super_email: str) -> None:
+    arguments = ["exec", "-T", "backend", "python", "-m",
+                 "app.scripts.initialize_admins", "--super-email", super_email]
+    if admin_email is not None:
+        arguments += ["--admin-email", admin_email]
+    run_compose(compose, arguments, tls=tls)
 
 
-def run_factory_reset(compose: list[str], tls: bool, admin_email: str, super_email: str) -> None:
-    run_compose(compose, ["exec", "-T", "backend", "python", "-m",
-                         "app.scripts.factory_reset", "--yes", "--admin-email", admin_email,
-                         "--super-email", super_email], tls=tls)
+def run_factory_reset(compose: list[str], tls: bool, admin_email: str | None, super_email: str) -> None:
+    arguments = ["exec", "-T", "backend", "python", "-m", "app.scripts.factory_reset",
+                 "--yes", "--use-login-defaults", "--super-email", super_email]
+    if admin_email is not None:
+        arguments += ["--admin-email", admin_email]
+    run_compose(compose, arguments, tls=tls)
 
 
 def main() -> None:
@@ -428,9 +440,14 @@ def main() -> None:
 
     header("4. Administrator identities")
     print(d("  Used only when initializing an empty deployment or when --reset was confirmed."))
-    admin_email = prompt("Email for the MSSP administrator", default="admin@detectmap.local")
+    admin_email = None
+    if existing is None:
+        admin_email = prompt("Email for the MSSP administrator", default=DEFAULT_LOGIN_EMAIL).strip().lower()
+    else:
+        print(d("  The backend uses the dashboard identity from its existing configuration."))
     super_email = prompt("Email for the product super admin", default="super@detectmap.local")
-    if not all(re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", value) and len(value) <= 255 for value in (admin_email, super_email)):
+    emails = [super_email] if admin_email is None else [admin_email, super_email]
+    if not all(re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", value) and len(value) <= 255 for value in emails):
         raise ValueError("Enter valid administrator email addresses.")
 
     if not keep:
@@ -441,7 +458,7 @@ def main() -> None:
         if existing is not None:
             update_network_env(**kwargs)
         else:
-            write_env(**kwargs)
+            write_env(**kwargs, admin_email=admin_email or DEFAULT_LOGIN_EMAIL)
         if tls_mode == "self-signed":
             generate_self_signed(server_host, compose)
             write_caddyfile()
@@ -465,8 +482,10 @@ def main() -> None:
         run_initialization(compose, use_tls, admin_email, super_email)
     header("Done")
     print(f"  Dashboard: {deployment['public_url']}")
-    print("  Existing accounts are unchanged. New temporary credentials, if created, were printed above.")
-    print("  New administrators must change their temporary passwords on first sign-in.")
+    print("  Fresh installs use the default dashboard administrator shown on the sign-in page.")
+    print("  Hide that credential card under Settings -> Branding; this does not disable the account.")
+    print("  A new product super admin receives a generated temporary password and must change it on first sign-in.")
+    print("  Existing accounts and sign-in hint settings are unchanged on a normal rerun.")
     if tls_mode == "self-signed":
         print("  Configure trust for your generated certificate before browser access.")
 

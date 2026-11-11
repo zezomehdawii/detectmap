@@ -9,7 +9,7 @@ DROPS (per-tenant + per-org state):
   - every row in public.user_preferences, custom_roles, users,
     customers, mssp_orgs, super_admins
   - audit_log + scheduled_job_runs
-  - app_settings (recreated on next API call with defaults)
+  - app_settings (recreated with the selected sign-in hint setting)
 
 PRESERVES (reference data the operator paid to ingest):
   - ATT&CK catalog: techniques, mitigations, groups, software, all
@@ -24,6 +24,10 @@ SEEDS (the only login that exists after the reset):
   - one MSSP admin with a generated random password
   - one super admin with a generated random password
   - both flagged `must_change_password=True`
+
+With --use-login-defaults, the dashboard administrator instead uses the
+configured login-card credentials, has no forced password change, and the
+card is enabled. The super admin remains separate with a temporary password.
 
 OUTPUT
 ======
@@ -53,9 +57,11 @@ from typing import Optional
 logging.getLogger("sqlalchemy.engine.Engine").setLevel(logging.WARNING)
 
 from sqlalchemy import delete, select, text  # noqa: E402
+from sqlalchemy.dialects.postgresql import insert as pg_insert  # noqa: E402
 
 from app.core.security import hash_password  # noqa: E402
 from app.db.base import AsyncSessionLocal, engine  # noqa: E402
+from app.scripts.initialize_admins import configured_login_credentials, normalize_admin_email  # noqa: E402
 
 engine.sync_engine.echo = False  # belt-and-braces with the log level above
 
@@ -141,8 +147,7 @@ async def _wipe_public_tenant_state() -> None:
             await session.execute(delete(MSSPOrg))
             await session.execute(delete(AuditLog))
             await session.execute(delete(ScheduledJobRun))
-            # app_settings is a singleton — wiping the row lets the next
-            # /settings/catalog read recreate it with defaults.
+            # Recreated with fresh defaults during seeding.
             await session.execute(delete(AppSettings))
 
 
@@ -159,6 +164,7 @@ async def _seed_admin(
     admin_password: str,
     super_email: str,
     super_password: str,
+    use_login_defaults: bool = False,
 ) -> None:
     async with AsyncSessionLocal() as session:
         async with session.begin():
@@ -176,7 +182,7 @@ async def _seed_admin(
                     is_active=True,
                     mssp_org_id=org.id,
                     customer_id=None,
-                    must_change_password=True,
+                    must_change_password=not use_login_defaults,
                 )
             )
             session.add(
@@ -187,6 +193,14 @@ async def _seed_admin(
                     full_name="Initial super admin",
                     is_active=True,
                     must_change_password=True,
+                )
+            )
+            # A random password does not match the configured login card.
+            await session.execute(
+                pg_insert(AppSettings).values(singleton=True, show_login_hint=use_login_defaults)
+                .on_conflict_do_update(
+                    index_elements=[AppSettings.singleton],
+                    set_={"show_login_hint": use_login_defaults},
                 )
             )
 
@@ -227,7 +241,18 @@ async def _summarise_preserved() -> dict:
 # ---- entrypoint ----------------------------------------------------------
 
 async def _amain(args: argparse.Namespace) -> int:
-    admin_password = args.admin_password or _gen_password()
+    use_login_defaults = getattr(args, "use_login_defaults", False)
+    if use_login_defaults:
+        # Fail before confirmation or any destructive call when the hint and
+        # seeded account would disagree. Use the configured dashboard password.
+        if args.admin_password is not None:
+            raise ValueError("--admin-password cannot be combined with --use-login-defaults")
+        admin_email, admin_password = configured_login_credentials(args.admin_email)
+        super_email = normalize_admin_email(args.super_email)
+    else:
+        admin_email = args.admin_email or DEFAULT_ADMIN_EMAIL
+        admin_password = args.admin_password or _gen_password()
+        super_email = args.super_email
     super_password = args.super_password or _gen_password()
 
     print()
@@ -257,10 +282,11 @@ async def _amain(args: argparse.Namespace) -> int:
     print(_dim("→ seeding initial admin + super admin..."))
     await _seed_admin(
         mssp_name=args.mssp_name,
-        admin_email=args.admin_email,
+        admin_email=admin_email,
         admin_password=admin_password,
-        super_email=args.super_email,
+        super_email=super_email,
         super_password=super_password,
+        use_login_defaults=use_login_defaults,
     )
 
     counts = await _summarise_preserved()
@@ -276,15 +302,20 @@ async def _amain(args: argparse.Namespace) -> int:
     print(_bold("Initial credentials — save these now, they are not recoverable:"))
     print()
     print(_yellow("  MSSP administrator"))
-    print(f"    email     {admin_email_display(args.admin_email)}")
+    print(f"    email     {admin_email_display(admin_email)}")
     print(f"    password  {_bold(admin_password)}")
     print()
     print(_yellow("  Product super admin"))
-    print(f"    email     {admin_email_display(args.super_email)}")
+    print(f"    email     {admin_email_display(super_email)}")
     print(f"    password  {_bold(super_password)}")
     print()
-    print(_dim("Both accounts will be required to change their password on first"))
-    print(_dim("login."))
+    if use_login_defaults:
+        print(_dim("Dashboard credentials are shown on the login page; hide the card"))
+        print(_dim("under Settings -> Branding when it is no longer needed."))
+        print(_dim("The product super admin must change its password on first login."))
+    else:
+        print(_dim("Both accounts will be required to change their password on first"))
+        print(_dim("login."))
     print()
     return 0
 
@@ -302,8 +333,8 @@ def main() -> None:
     )
     p.add_argument(
         "--admin-email",
-        default=DEFAULT_ADMIN_EMAIL,
-        help=f"Email for the seed MSSP admin (default: {DEFAULT_ADMIN_EMAIL!r})",
+        default=None,
+        help=f"Seed MSSP admin email (default: {DEFAULT_ADMIN_EMAIL!r}; DEFAULT_LOGIN_EMAIL with --use-login-defaults)",
     )
     p.add_argument(
         "--admin-password",
@@ -321,6 +352,11 @@ def main() -> None:
         help="Password for the seed super admin (default: generated, ~24 chars)",
     )
     p.add_argument(
+        "--use-login-defaults",
+        action="store_true",
+        help="Seed the dashboard account from DEFAULT_LOGIN_EMAIL/PASSWORD and enable the login-page card",
+    )
+    p.add_argument(
         "--yes",
         action="store_true",
         help="Skip the typed RESET confirmation (use for unattended setup)",
@@ -329,6 +365,8 @@ def main() -> None:
 
     try:
         rc = asyncio.run(_amain(args))
+    except ValueError as exc:
+        p.error(str(exc))
     except KeyboardInterrupt:
         print()
         rc = 130

@@ -17,6 +17,13 @@ from app.scripts import initialize_admins as initial
 from app.scripts.generate_tls import generate_certificate
 
 
+@pytest.fixture(autouse=True)
+def login_defaults(monkeypatch):
+    monkeypatch.setattr(initial, "settings", SimpleNamespace(
+        default_login_email="admin@demo.local", default_login_password="change-me",
+    ))
+
+
 class Transaction:
     def __init__(self, session):
         self.session = session
@@ -68,7 +75,8 @@ async def test_existing_state_never_creates_accounts_or_generates_passwords(monk
     monkeypatch.setattr(initial, "AsyncSessionLocal", lambda: session)
     generate = Mock(side_effect=AssertionError("existing deployment must not generate credentials"))
     monkeypatch.setattr(initial.secrets, "token_urlsafe", generate)
-    result = await initial.initialize_admins()
+    monkeypatch.setattr(initial, "settings", SimpleNamespace(default_login_email="invalid", default_login_password=""))
+    result = await initial.initialize_admins(admin_email="invalid", super_email="invalid")
     assert not result.empty and not result.created
     assert session.added == [] and session.committed
     assert "pg_advisory_xact_lock" in session.queries[0][0]
@@ -76,40 +84,42 @@ async def test_existing_state_never_creates_accounts_or_generates_passwords(monk
 
 
 @pytest.mark.asyncio
-async def test_fresh_initialization_creates_two_forced_change_accounts_after_commit(monkeypatch):
+async def test_fresh_initialization_matches_login_card_and_keeps_super_admin_separate(monkeypatch):
     session = Session([0, 0, 0, 0, False])
     monkeypatch.setattr(initial, "AsyncSessionLocal", lambda: session)
-    monkeypatch.setattr(initial.secrets, "token_urlsafe", Mock(side_effect=["admin-temporary", "super-temporary"]))
+    monkeypatch.setattr(initial.secrets, "token_urlsafe", Mock(return_value="super-temporary"))
     monkeypatch.setattr(initial, "hash_password", lambda value: "hashed:" + value)
     output = io.StringIO()
     with redirect_stdout(output):
-        result = await initial.initialize_admins(admin_email=" ADMIN@EXAMPLE.LOCAL ", super_email=" SUPER@EXAMPLE.LOCAL ")
+        result = await initial.initialize_admins(admin_email=" ADMIN@DEMO.LOCAL ", super_email=" SUPER@EXAMPLE.LOCAL ")
     assert output.getvalue() == ""  # The transaction function never prints secrets.
     assert session.committed and result.created
     assert len(session.added) == 3
     org, admin, super_admin = session.added
     assert isinstance(org, MSSPOrg) and isinstance(admin, User) and isinstance(super_admin, SuperAdmin)
     assert admin.role == Role.MSSP_ADMIN and admin.mssp_org_id == org.id
-    assert admin.email == "admin@example.local" and super_admin.email == "super@example.local"
-    assert admin.must_change_password and super_admin.must_change_password
-    assert admin.hashed_password == "hashed:admin-temporary"
+    assert admin.email == "admin@demo.local" and super_admin.email == "super@example.local"
+    assert not admin.must_change_password and super_admin.must_change_password
+    assert admin.hashed_password == "hashed:change-me"
     assert super_admin.hashed_password == "hashed:super-temporary"
-    assert "admin-temporary" not in repr(result)
+    assert "change-me" not in repr(result)
     with redirect_stdout(output):
         initial.print_result(result)
-    assert output.getvalue().count("admin-temporary") == 1
+    assert output.getvalue().count("change-me") == 1
     assert output.getvalue().count("super-temporary") == 1
+    assert "Settings -> Branding" in output.getvalue()
+    initial.secrets.token_urlsafe.assert_called_once_with(24)
 
 
 @pytest.mark.asyncio
-async def test_new_administrators_hide_placeholder_login_without_resetting_other_settings(monkeypatch):
+async def test_fresh_initialization_enables_matching_hint_without_resetting_other_settings(monkeypatch):
     session = Session([0, 0, 0, 0, False])
     monkeypatch.setattr(initial, "AsyncSessionLocal", lambda: session)
     monkeypatch.setattr(initial, "hash_password", lambda _: "hash")
     await initial.initialize_admins()
     statement = next(query for query in session.statements if str(query).startswith("INSERT INTO public.app_settings"))
     compiled = statement.compile()
-    assert compiled.params["show_login_hint"] is False
+    assert compiled.params["show_login_hint"] is True
     update = str(compiled).split("DO UPDATE SET", 1)[1]
     assert update.strip().startswith("show_login_hint =")
     assert "," not in update  # No other existing singleton settings are replaced.
@@ -120,7 +130,8 @@ async def test_status_only_reports_empty_without_password_generation_or_mutation
     session = Session([0, 0, 0, 0, False])
     monkeypatch.setattr(initial, "AsyncSessionLocal", lambda: session)
     monkeypatch.setattr(initial.secrets, "token_urlsafe", Mock(side_effect=AssertionError("status must not generate credentials")))
-    result = await initial.initialize_admins(status_only=True)
+    monkeypatch.setattr(initial, "settings", SimpleNamespace(default_login_email="invalid", default_login_password=""))
+    result = await initial.initialize_admins(admin_email="invalid", super_email="invalid", status_only=True)
     assert result.empty and not result.created and session.added == []
     output = io.StringIO()
     with redirect_stdout(output):
@@ -137,6 +148,46 @@ async def test_failed_commit_returns_no_credentials_or_printed_passwords(monkeyp
     with redirect_stdout(output), pytest.raises(RuntimeError, match="commit failure"):
         await initial.initialize_admins()
     assert output.getvalue() == ""
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("configured_email,password,selected_email,super_email,error", [
+    ("invalid", "change-me", None, "super@example.local", "DEFAULT_LOGIN_EMAIL"),
+    ("admin@example.local", "", None, "super@example.local", "DEFAULT_LOGIN_PASSWORD"),
+    ("admin@example.local", "       ", None, "super@example.local", "DEFAULT_LOGIN_PASSWORD"),
+    ("admin@example.local", "short", None, "super@example.local", "DEFAULT_LOGIN_PASSWORD"),
+    ("admin@example.local", "ü" * 37, None, "super@example.local", "72-byte limit"),
+    ("admin@example.local", "change-me", "other@example.local", "super@example.local", "must match"),
+    ("admin@example.local", "change-me", None, "invalid", "valid email"),
+])
+async def test_invalid_fresh_credentials_fail_before_any_write_or_password_generation(
+    monkeypatch, configured_email, password, selected_email, super_email, error,
+):
+    session = Session([0, 0, 0, 0, False])
+    monkeypatch.setattr(initial, "AsyncSessionLocal", lambda: session)
+    monkeypatch.setattr(initial, "settings", SimpleNamespace(
+        default_login_email=configured_email, default_login_password=password,
+    ))
+    monkeypatch.setattr(initial.secrets, "token_urlsafe", Mock(side_effect=AssertionError("must validate first")))
+    with pytest.raises(ValueError, match=error):
+        await initial.initialize_admins(admin_email=selected_email, super_email=super_email)
+    assert session.added == []
+    assert not session.committed
+    assert not any("INSERT" in str(statement) for statement in session.statements)
+
+
+@pytest.mark.asyncio
+async def test_configured_email_is_the_default_when_no_email_argument_is_supplied(monkeypatch):
+    session = Session([0, 0, 0, 0, False])
+    monkeypatch.setattr(initial, "AsyncSessionLocal", lambda: session)
+    monkeypatch.setattr(initial, "settings", SimpleNamespace(
+        default_login_email=" TRAINER@EXAMPLE.LOCAL ", default_login_password="classroom-password",
+    ))
+    monkeypatch.setattr(initial, "hash_password", lambda value: "hashed:" + value)
+    result = await initial.initialize_admins()
+    assert result.admin_email == "trainer@example.local"
+    assert result.admin_password == "classroom-password"
+    assert session.added[1].hashed_password == "hashed:classroom-password"
 
 
 @pytest.mark.parametrize("host", ["hmi.example.local", "192.0.2.44", "2001:db8::1"])

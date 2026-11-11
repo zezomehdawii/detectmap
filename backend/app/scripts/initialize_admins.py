@@ -1,11 +1,12 @@
 """Create initial administrators only for a genuinely empty deployment.
 
     python -m app.scripts.initialize_admins \
-        --admin-email admin@detectmap.local --super-email super@detectmap.local
+        --super-email super@detectmap.local
 
 Existing accounts, organizations, customers, and customer schemas are never
-modified. Passwords are generated inside this process and printed only after
-the database transaction commits. No password command arguments are accepted.
+modified. The dashboard administrator uses the configured login-card defaults;
+the separate product super admin receives a generated temporary password.
+Credentials are printed only after the database transaction commits.
 """
 from __future__ import annotations
 
@@ -22,6 +23,7 @@ import uuid
 from sqlalchemy import func, select, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
+from app.config import settings
 from app.core.security import hash_password
 from app.db.base import AsyncSessionLocal, engine
 from app.models.public import AppSettings, Customer, MSSPOrg, Role, SuperAdmin, User
@@ -31,7 +33,6 @@ from app.models.public import AppSettings, Customer, MSSPOrg, Role, SuperAdmin, 
 engine.sync_engine.echo = False
 logging.getLogger("sqlalchemy.engine.Engine").setLevel(logging.WARNING)
 
-DEFAULT_ADMIN_EMAIL = "admin@detectmap.local"
 DEFAULT_SUPER_EMAIL = "super@detectmap.local"
 DEFAULT_MSSP_NAME = "Detect Map"
 INITIALIZATION_LOCK = 741225031
@@ -47,11 +48,28 @@ class InitializationResult:
     super_password: str | None = field(default=None, repr=False)
 
 
-def _email(value: str) -> str:
+def normalize_admin_email(value: str) -> str:
     value = value.strip().lower()
     if len(value) > 255 or not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", value):
         raise ValueError("Administrator identities must be valid email addresses up to 255 characters")
     return value
+
+
+def configured_login_credentials(admin_email: str | None = None) -> tuple[str, str]:
+    """Validate the dashboard seed and its public login hint as one identity."""
+    try:
+        configured_email = normalize_admin_email(settings.default_login_email)
+    except (ValueError, AttributeError):
+        raise ValueError("DEFAULT_LOGIN_EMAIL must contain a valid administrator email address") from None
+    selected_email = configured_email if admin_email is None else normalize_admin_email(admin_email)
+    if selected_email != configured_email:
+        raise ValueError("Administrator email must match DEFAULT_LOGIN_EMAIL so the login-page credentials work")
+    password = settings.default_login_password
+    if not isinstance(password, str) or not password.strip() or len(password) < 8:
+        raise ValueError("DEFAULT_LOGIN_PASSWORD must contain at least 8 characters")
+    if len(password.encode("utf-8")) > 72:
+        raise ValueError("DEFAULT_LOGIN_PASSWORD must fit within bcrypt's 72-byte limit")
+    return selected_email, password
 
 
 async def _deployment_empty(session) -> bool:
@@ -68,11 +86,10 @@ async def _deployment_empty(session) -> bool:
 
 
 async def initialize_admins(
-    *, admin_email: str = DEFAULT_ADMIN_EMAIL,
+    *, admin_email: str | None = None,
     super_email: str = DEFAULT_SUPER_EMAIL,
     status_only: bool = False,
 ) -> InitializationResult:
-    admin_email, super_email = _email(admin_email), _email(super_email)
     result = InitializationResult(empty=False)
     async with AsyncSessionLocal() as session:
         async with session.begin():
@@ -83,7 +100,10 @@ async def initialize_admins(
             if not empty or status_only:
                 result = InitializationResult(empty=empty)
             else:
-                admin_password = secrets.token_urlsafe(24)
+                # Check only after ownership probes, before the first write.
+                # Reruns must not depend on unused initialization inputs.
+                admin_email, admin_password = configured_login_credentials(admin_email)
+                super_email = normalize_admin_email(super_email)
                 super_password = secrets.token_urlsafe(24)
                 org = MSSPOrg(id=uuid.uuid4(), name=DEFAULT_MSSP_NAME)
                 session.add(org)
@@ -93,7 +113,7 @@ async def initialize_admins(
                     hashed_password=hash_password(admin_password),
                     role=Role.MSSP_ADMIN, auth_source="local",
                     full_name="Initial administrator", is_active=True,
-                    mssp_org_id=org.id, customer_id=None, must_change_password=True,
+                    mssp_org_id=org.id, customer_id=None, must_change_password=False,
                 ))
                 session.add(SuperAdmin(
                     id=uuid.uuid4(), email=super_email,
@@ -102,14 +122,13 @@ async def initialize_admins(
                     must_change_password=True,
                 ))
                 await session.flush()
-                # The configured demo login hint is unrelated to these newly
-                # generated credentials. Disable that hint atomically while
-                # preserving every other setting on an existing singleton.
+                # The card and the dashboard account share the same validated
+                # credentials. Preserve all other singleton settings.
                 await session.execute(
-                    pg_insert(AppSettings).values(singleton=True, show_login_hint=False)
+                    pg_insert(AppSettings).values(singleton=True, show_login_hint=True)
                     .on_conflict_do_update(
                         index_elements=[AppSettings.singleton],
-                        set_={"show_login_hint": False},
+                        set_={"show_login_hint": True},
                     )
                 )
                 result = InitializationResult(
@@ -128,18 +147,20 @@ def print_result(result: InitializationResult, *, status_only: bool = False) -> 
     elif not result.created:
         print("Existing deployment detected; administrator accounts unchanged.")
     else:
-        print("Initial administrators created. Save these generated credentials now:")
+        print("Initial administrators created:")
         print(f"  MSSP administrator: {result.admin_email}")
-        print(f"  Temporary password: {result.admin_password}")
+        print(f"  Default password: {result.admin_password}")
+        print("  These dashboard credentials are shown on the login page.")
+        print("  Hide the card under Settings -> Branding when it is no longer needed.")
         print(f"  Product super admin: {result.super_email}")
         print(f"  Temporary password: {result.super_password}")
-        print("Both accounts must change their password on first sign-in.")
-        print("Passwords will not be printed again by a subsequent setup run.")
+        print("The product super admin must change its password on first sign-in.")
+        print("Its temporary password will not be printed again by a subsequent setup run.")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--admin-email", default=DEFAULT_ADMIN_EMAIL)
+    parser.add_argument("--admin-email", default=None, help="Dashboard administrator email (default: DEFAULT_LOGIN_EMAIL)")
     parser.add_argument("--super-email", default=DEFAULT_SUPER_EMAIL)
     parser.add_argument("--status-only", action="store_true", help="Report whether initialization is possible without changing records")
     args = parser.parse_args()

@@ -104,12 +104,21 @@ The configuration prompts provide suggested values; press **Enter** to accept:
 1. **Hostname/IP:** a detected LAN IPv4 address; the detected hostname is also shown.
 2. **Transport:** HTTP, HTTPS with a generated certificate, or HTTPS with your certificate.
 3. **Listen port:** HTTP defaults to **8080**, HTTPS to **8443**. The chosen port drives the actual frontend/proxy mapping.
-4. **Administrator identities:** `admin@detectmap.local` and `super@detectmap.local`.
+4. **Administrator identities:** `admin@demo.local` for the dashboard and `super@detectmap.local` for product administration. A custom dashboard email is also written to the sign-in hint configuration.
 
 Setup builds and starts the stack, waits for the API, and initializes the two
-administrators **only when the deployment is empty**. Random temporary
-passwords are printed once, after commit, and must be changed on first login.
-Existing deployments, accounts, and customer data remain unchanged.
+administrators **only when the deployment is empty**. The dashboard administrator
+uses the credentials displayed on the login page: **`admin@demo.local` / `change-me`**
+by default. Under **Settings → Branding**, turn off **Show default credentials on
+the sign-in page** to hide the card; the administrator account remains active.
+The dashboard account can sign in directly without a forced password change.
+Its password can be changed later; the hint contains the configured bootstrap
+credentials and does not track later password changes.
+
+The product super administrator has a separate, randomly generated temporary
+password, printed once after commit, and must change it on first login.
+Existing deployments, accounts, visibility settings, and customer data remain
+unchanged on normal reruns.
 
 An existing `.env` is kept by default. Choosing to reconfigure updates only
 network settings, retaining database credentials, encryption keys, and other
@@ -121,7 +130,8 @@ python3 setup.py --keep-env --skip-reset
 ```
 
 A factory reset is available only with `--reset`, and setup asks for confirmation
-before dependency installation or deployment changes. Do not use it for an upgrade.
+before dependency installation or deployment changes. It restores the configured
+dashboard default login and its credential card. Do not use it for an upgrade.
 
 Dependency instructions are based on [Docker's Ubuntu](https://docs.docker.com/engine/install/ubuntu/),
 [Debian](https://docs.docker.com/engine/install/debian/), and
