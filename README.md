@@ -26,6 +26,7 @@ sits on top of them.
 | **Foundation** | Multi-tenant Postgres (schema-per-customer), dual JWT audiences, RBAC (5 built-in roles + custom roles), two-tree Alembic migrations, Docker Compose stack with optional TLS overlay (Caddy), interactive `setup.py`. |
 | **Catalog** | ATT&CK STIX ingest (Enterprise · ICS · Mobile) with version diffs, mitigations + technique→mitigation relationships, ATT&CK Groups + Software + relationships, D3FEND inferred mappings, scheduled refresh via celerybeat. |
 | **Detections** | SigmaHQ public ruleset sync, "edit a global flips to customized" semantics, per-tenant CRUD, Sigma YAML import/export, pySigma → SPL / Lucene / KQL exports, AI-assisted Sigma authoring (bring-your-own Anthropic key), unit-test event samples, effectiveness loop (TP/FP/unsure), cross-tenant rule promotion. |
+| **Use-case tracker** | Detection Library version history with the date, editor, purpose, and before/after values for each saved change. |
 | **Coverage** | DeTT&CT A-B (breadth) × A-D (depth) scoring, posture grade, full/sector/APT/custom denominators, Navigator-style matrix with consolidated technique drawer, per-technique notes, saved filter views, snapshot delta + diff page. |
 | **Analyst workflow** | APT coverage, gap analysis (rank by APT prevalence in scope, ignore-with-reason, comments), portfolio roll-up, customer comparison, global search (Ctrl/⌘+K), ATT&CK release notifications. |
 | **GRC** | NIST CSF · ISO 27001 · NCA ECC / CSCC / CCC-CSP / CCC-CST / OTCC crosswalks; technique→control mapping; D3FEND defensive countermeasures per control; control-coverage view; compliance-evidence exports. |
@@ -416,6 +417,22 @@ tests, no DB). Customer-profile tests cover assets CRUD + linkage + RBAC
 
 ---
 
+## Track changes to detection use cases
+
+1. Open a workspace's **Detection Library** and select a rule.
+2. Choose **Edit use case** to update the Sigma YAML or coverage scores. For a catalog rule, **Customize use case** saves a workspace copy.
+3. Enter the **Purpose of change** and save. Status and owner updates also require a purpose.
+4. Open **Version history** to review who made each change, when, why, and the previous and new field values.
+
+Rules already in the library start at version 1 with their current content as
+the baseline. Saving without changes keeps the same version. Review decisions
+remain in the rule's review history. Connector imports reflect rules observed
+in the SIEM. Deleting a use case also deletes its version history.
+
+The standard Compose backend applies customer migrations before serving
+requests. For a custom launch command, run the public migrations and then
+`python -m app.scripts.upgrade_tenants --all --apply` in the backend environment.
+
 ## Discover assets from a capture
 
 1. Open a workspace's **Collection register** or its customer **Profile** and select **Discover assets**.
@@ -446,9 +463,9 @@ mode to run separate student workspaces. Create these users
 under **Customers → select customer → Users**. Each student/team should have
 its own customer so its collection inventory and plan remain separate.
 
-Existing tenants must apply migration `0013_cmf_validation_fields`; restarting
-the containers alone does not apply customer migrations. The guide includes
-an explicit upgrade command that preserves the current inventory and accounts.
+Existing tenants need migration `0013_cmf_validation_fields`. The standard
+Compose backend applies it at startup. The guide also includes an explicit
+upgrade command that preserves the current inventory and accounts.
 
 CMF integration tests in `tests/test_cmf_classroom_integration.py` run only
 against the explicitly isolated `localhost:15432/cmf_test` database. They

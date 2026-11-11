@@ -6,7 +6,7 @@ The CMF workspace follows requirements → collection plan → implementation �
 
 1. Start Detect Map and select **Multi-tenant** during setup or under **Settings → Deployment**. You can choose **Start fresh**. The general Acme and Globex samples are separate from the classroom starter data. Do not run `setup.py --reset` or `factory_reset` on an existing deployment to prepare this lab.
 2. Create a dedicated customer for each student/team through the existing administration UI, then create a customer user pinned to that customer. Choose globally unique codenames such as `cmf_team01`, `cmf_team02`. Existing tenant schema names are derived from codenames.
-3. New customers receive current tenant migrations. For existing classroom customers, first preview and then explicitly apply the tenant upgrades. These commands do not reseed detections or reset data:
+3. New customers receive current tenant migrations, and the standard Compose backend upgrades existing customers at startup. For a custom deployment, use these commands to preview and upgrade selected classroom customers:
 
 ```sh
 docker compose exec backend python -m app.scripts.upgrade_tenants --customer cmf_team01 --customer cmf_team02

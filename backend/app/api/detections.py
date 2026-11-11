@@ -3,10 +3,10 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
-from typing import Optional
+from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import and_, delete, func, select
 
 from app.api.deps import (
@@ -23,6 +23,7 @@ from app.models.customer import (
     DetectionSource,
     DetectionStatus,
     DetectionTechnique,
+    DetectionVersion,
     SigmaLevel,
 )
 from app.models.public import Role
@@ -38,6 +39,14 @@ from app.services.detection_review import (
     parse_review_action,
     parse_review_status,
     review_status_value,
+)
+from app.services.detection_versions import (
+    REVIEW_NEUTRAL_FIELDS,
+    append_version,
+    field_changes,
+    history_for,
+    initial_version,
+    snapshot,
 )
 from app.services.sigma_validate import (
     SigmaValidationError,
@@ -68,6 +77,8 @@ class DetectionListItem(BaseModel):
     techniques: list[str]
     owner: Optional[str]
     review_status: str
+    version: int
+    last_changed_at: datetime
 
 
 class DetectionReviewEventOut(BaseModel):
@@ -78,6 +89,17 @@ class DetectionReviewEventOut(BaseModel):
     note: Optional[str]
     actor_email: Optional[str]
     created_at: datetime
+
+
+class DetectionVersionOut(BaseModel):
+    version: int
+    changed_at: datetime
+    changed_by_user_id: Optional[uuid.UUID]
+    changed_by_email: Optional[str]
+    changed_by_name: Optional[str]
+    change_reason: str
+    source: str
+    changes: dict[str, dict[str, Any]]
 
 
 class DetectionDetail(DetectionListItem):
@@ -113,14 +135,16 @@ class DetectionCreate(BaseModel):
 
 class DetectionPatch(BaseModel):
     raw_yaml: Optional[str] = None
-    title: Optional[str] = None
+    title: Optional[str] = Field(default=None, min_length=1, max_length=500)
     description: Optional[str] = None
     detection_status: Optional[str] = None
     level: Optional[str] = None
     score_breadth: Optional[int] = None
     score_depth: Optional[int] = None
     tags: Optional[list[str]] = None
-    owner: Optional[str] = None
+    owner: Optional[str] = Field(default=None, max_length=200)
+    change_reason: Optional[str] = Field(default=None, max_length=2000)
+    expected_version: Optional[int] = Field(default=None, ge=1)
 
 
 class ReviewActionIn(BaseModel):
@@ -128,6 +152,7 @@ class ReviewActionIn(BaseModel):
     note: Optional[str] = None
     reviewer_email: Optional[str] = None
     review_due_at: Optional[datetime] = None
+    expected_version: Optional[int] = Field(default=None, ge=1)
 
 
 def _validate_status(s: Optional[str]) -> Optional[DetectionStatus]:
@@ -180,7 +205,13 @@ def _serialize_list_item(d: Detection, technique_ids: list[str]) -> DetectionLis
         techniques=technique_ids,
         owner=d.owner,
         review_status=review_status_value(d.review_status),
+        version=d.version,
+        last_changed_at=d.last_changed_at,
     )
+
+
+def _serialize_version(event: DetectionVersion) -> DetectionVersionOut:
+    return DetectionVersionOut.model_validate(event, from_attributes=True)
 
 
 def _serialize_review_event(event: DetectionReviewEvent) -> DetectionReviewEventOut:
@@ -257,7 +288,7 @@ async def _replace_technique_mappings(
     await session.execute(
         delete(DetectionTechnique).where(DetectionTechnique.detection_id == detection_id)
     )
-    tids = techniques_from_tags(tags)
+    tids = dict.fromkeys(techniques_from_tags(tags))
     if not tids:
         return
     for tid in tids:
@@ -361,6 +392,19 @@ async def get_detection(
     return _serialize_detail(row, tech_map.get(row.id, []), events)
 
 
+@router.get("/{detection_id:uuid}/history", response_model=list[DetectionVersionOut])
+async def get_detection_history(
+    detection_id: uuid.UUID,
+    _: TenantPrincipal = Depends(require_perm(Permission.DETECTION_READ)),
+    __: TenantPrincipal = Depends(require_active_customer()),
+) -> list[DetectionVersionOut]:
+    async with tenant_session() as session:
+        row = await session.get(Detection, detection_id)
+        if row is None:
+            raise HTTPException(404, "detection not found")
+        return [_serialize_version(event) for event in await history_for(session, row)]
+
+
 @router.post("", response_model=DetectionDetail, status_code=201)
 async def create_detection(
     payload: DetectionCreate,
@@ -411,30 +455,62 @@ async def create_detection(
         )
         session.add(det)
         await session.flush()
+        session.add(initial_version(
+            det, actor=_principal.user, reason="Created use case.", source="created"
+        ))
         await _replace_technique_mappings(session, det.id, parsed["tags"])
         tech_map = await _techniques_for(session, [det.id])
     return _serialize_detail(det, tech_map.get(det.id, []))
 
 
-def _has_substantive_changes(payload: DetectionPatch) -> bool:
-    """True when the patch changes the rule's behavior or presentation.
+def _required_change_reason(reason: str | None) -> str:
+    purpose = (reason or "").strip()
+    if not purpose:
+        raise HTTPException(422, "Enter the purpose of the change.")
+    return purpose
 
-    Owner changes are deliberately excluded: reassigning a rule does not
-    invalidate a review. Status-only changes are also excluded; the gate
-    handles promotion separately.
-    """
-    return any(
-        value is not None
-        for value in (
-            payload.raw_yaml,
-            payload.title,
-            payload.description,
-            payload.tags,
-            payload.level,
-            payload.score_breadth,
-            payload.score_depth,
-        )
+
+def _require_current_version(row: Detection, expected: int | None) -> None:
+    if expected is not None and expected != row.version:
+        raise HTTPException(409, "This use case changed since you opened it. Reload it and try again.")
+
+
+def _patch_fields(row: Detection, payload: DetectionPatch) -> dict[str, Any]:
+    updates = payload.model_dump(
+        include={"title", "description", "tags", "score_breadth", "score_depth", "owner"},
+        exclude_none=True,
     )
+    if "owner" in updates:
+        updates["owner"] = updates["owner"] or None
+    if payload.detection_status is not None:
+        updates["detection_status"] = _validate_status(payload.detection_status)
+
+    if payload.raw_yaml is not None and payload.raw_yaml != row.raw_yaml:
+        try:
+            parsed = parse_sigma_yaml(payload.raw_yaml)
+        except SigmaValidationError as exc:
+            raise HTTPException(422, str(exc)) from exc
+
+        # Imported copies can have a tenant-local identifier distinct from
+        # the identifier of the original rule stored in their YAML.
+        old_sigma_id = row.sigma_id
+        if row.raw_yaml:
+            try:
+                old_sigma_id = parse_sigma_yaml(row.raw_yaml)["sigma_id"]
+            except SigmaValidationError:
+                pass
+        if parsed["sigma_id"] != old_sigma_id:
+            raise HTTPException(422, "Keep the existing Sigma rule ID when editing its YAML.")
+        updates.update({
+            field: parsed[field] for field in (
+                "title", "description", "tags", "sigma_status", "author",
+                "sigma_references", "logsource", "detection", "falsepositives", "raw_yaml",
+            )
+        })
+        updates["level"] = _validate_level(parsed["level"])
+    if payload.level is not None:
+        updates["level"] = _validate_level(payload.level)
+    return updates
 
 
 @router.patch("/{detection_id:uuid}", response_model=DetectionDetail)
@@ -445,130 +521,68 @@ async def patch_detection(
     __: TenantPrincipal = Depends(require_active_customer()),
     ___: TenantPrincipal = Depends(require_feature("detection_editing")),
 ) -> DetectionDetail:
-    """PATCH semantics:
-       - source=global   → clone to a new row with source=customized
-                           (preserves upstream link). Original is untouched.
-       - source=custom/customized → mutate in place.
-
-    A transition into `deployed` requires an approved review. A patch that
-    both edits the rule and promotes it is rejected: the edit invalidates the
-    approval it would otherwise rely on.
-    """
+    """Update a use case and record a version in the same transaction."""
     async with tenant_session() as session:
         row = (
             await session.execute(
-                select(Detection).where(Detection.id == detection_id)
+                select(Detection).where(Detection.id == detection_id).with_for_update()
             )
         ).scalar_one_or_none()
         if row is None:
             raise HTTPException(404, "detection not found")
+        _require_current_version(row, payload.expected_version)
 
-        parsed = None
-        if payload.raw_yaml is not None:
-            try:
-                parsed = parse_sigma_yaml(payload.raw_yaml)
-            except SigmaValidationError as e:
-                raise HTTPException(422, str(e)) from e
+        before = snapshot(row)
+        updates = _patch_fields(row, payload)
+        changes = field_changes(before, updates)
+        if not changes:
+            tech_map = await _techniques_for(session, [row.id])
+            events = await _review_events_for(session, row.id)
+            return _serialize_detail(row, tech_map.get(row.id, []), events)
 
-        new_status = _validate_status(payload.detection_status)
-        substantive = _has_substantive_changes(payload)
-
-        if row.source == DetectionSource.GLOBAL:
-            # Customizing a global rule creates a new customer-owned rule, so
-            # it starts a fresh review. An explicit request to deploy that new
-            # rule is always blocked until it has been reviewed.
-            if new_status == DetectionStatus.DEPLOYED:
+        substantive = bool(changes.keys() - REVIEW_NEUTRAL_FIELDS)
+        is_global = row.source == DetectionSource.GLOBAL
+        new_status = updates.get("detection_status")
+        if new_status == DetectionStatus.DEPLOYED:
+            if is_global:
                 raise HTTPException(409, GLOBAL_RULE_REVIEW_REQUIRED)
+            if row.detection_status != DetectionStatus.DEPLOYED:
+                if substantive:
+                    raise HTTPException(409, DEPLOYMENT_EDIT_REVIEW_REQUIRED)
+                blocked = deployment_block_reason(row)
+                if blocked:
+                    raise HTTPException(409, blocked)
 
-            upstream_id = row.upstream_global_id or row.sigma_id
+        purpose = _required_change_reason(payload.change_reason)
+        if is_global:
             target = Detection(
                 id=uuid.uuid4(),
                 sigma_id=row.sigma_id,
-                title=parsed["title"] if parsed else (payload.title or row.title),
-                description=(
-                    parsed["description"]
-                    if parsed
-                    else (payload.description if payload.description is not None else row.description)
-                ),
-                sigma_status=parsed["sigma_status"] if parsed else row.sigma_status,
-                level=_validate_level(payload.level) or row.level,
-                author=parsed["author"] if parsed else row.author,
-                sigma_references=parsed["sigma_references"] if parsed else list(row.sigma_references or []),
-                tags=(
-                    parsed["tags"]
-                    if parsed
-                    else (payload.tags if payload.tags is not None else list(row.tags or []))
-                ),
-                logsource=parsed["logsource"] if parsed else dict(row.logsource or {}),
-                detection=parsed["detection"] if parsed else dict(row.detection or {}),
-                falsepositives=parsed["falsepositives"] if parsed else list(row.falsepositives or []),
-                raw_yaml=parsed["raw_yaml"] if parsed else row.raw_yaml,
-                detection_status=new_status or row.detection_status,
                 source=DetectionSource.CUSTOMIZED,
-                score_breadth=payload.score_breadth if payload.score_breadth is not None else row.score_breadth,
-                score_depth=payload.score_depth if payload.score_depth is not None else row.score_depth,
-                upstream_global_id=upstream_id,
-                owner=(
-                    (payload.owner or None)
-                    if payload.owner is not None
-                    else row.owner
-                ),
+                upstream_global_id=row.upstream_global_id or row.sigma_id,
                 review_status="draft",
+                **(before | updates),
             )
             session.add(target)
             await session.flush()
-            await _replace_technique_mappings(session, target.id, target.tags)
         else:
-            if (
-                new_status == DetectionStatus.DEPLOYED
-                and row.detection_status != DetectionStatus.DEPLOYED
-            ):
-                if substantive:
-                    raise HTTPException(409, DEPLOYMENT_EDIT_REVIEW_REQUIRED)
-                reason = deployment_block_reason(row)
-                if reason:
-                    raise HTTPException(409, reason)
-
-            if parsed is not None:
-                row.title = parsed["title"]
-                row.description = parsed["description"]
-                row.sigma_status = parsed["sigma_status"]
-                row.author = parsed["author"]
-                row.sigma_references = parsed["sigma_references"]
-                row.tags = parsed["tags"]
-                row.logsource = parsed["logsource"]
-                row.detection = parsed["detection"]
-                row.falsepositives = parsed["falsepositives"]
-                row.raw_yaml = parsed["raw_yaml"]
-            else:
-                if payload.title is not None:
-                    row.title = payload.title
-                if payload.description is not None:
-                    row.description = payload.description
-                if payload.tags is not None:
-                    row.tags = payload.tags
-            if new_status is not None:
-                row.detection_status = new_status
-            if payload.level is not None:
-                row.level = _validate_level(payload.level)
-            if payload.score_breadth is not None:
-                row.score_breadth = payload.score_breadth
-            if payload.score_depth is not None:
-                row.score_depth = payload.score_depth
-            if payload.owner is not None:
-                row.owner = payload.owner or None
-
+            target = row
+            for field in changes:
+                setattr(target, field, updates[field])
             if substantive:
                 event = invalidate_review(
-                    row,
+                    target,
                     actor_email=_principal.user.email,
                     reason="Detection content changed; review must be repeated.",
                 )
                 if event is not None:
                     session.add(event)
 
-            await _replace_technique_mappings(session, row.id, list(row.tags or []))
-            target = row
+        await append_version(
+            session, target, before=before, changes=changes, actor=_principal.user, reason=purpose
+        )
+        if is_global or "tags" in changes:
+            await _replace_technique_mappings(session, target.id, list(target.tags or []))
         await session.flush()
         tech_map = await _techniques_for(session, [target.id])
         events = await _review_events_for(session, target.id)
@@ -592,13 +606,14 @@ async def review_detection(
     async with tenant_session() as session:
         row = (
             await session.execute(
-                select(Detection).where(Detection.id == detection_id)
+                select(Detection).where(Detection.id == detection_id).with_for_update()
             )
         ).scalar_one_or_none()
         if row is None:
             raise HTTPException(404, "detection not found")
         if row.source == DetectionSource.GLOBAL:
             raise HTTPException(409, GLOBAL_RULE_REVIEW_REFUSED)
+        _require_current_version(row, payload.expected_version)
 
         try:
             event = apply_review_action(
@@ -643,6 +658,7 @@ async def delete_detection(
 class BulkStatusIn(BaseModel):
     ids: list[uuid.UUID]
     detection_status: str
+    change_reason: Optional[str] = Field(default=None, max_length=2000)
 
 
 class BulkResultOut(BaseModel):
@@ -668,21 +684,28 @@ async def bulk_status(
     updated = skipped = blocked = 0
     async with tenant_session() as session:
         rows = (
-            await session.execute(select(Detection).where(Detection.id.in_(payload.ids)))
+            await session.execute(
+                select(Detection)
+                .where(Detection.id.in_(payload.ids))
+                .order_by(Detection.id)
+                .with_for_update()
+            )
         ).scalars().all()
         for row in rows:
-            if row.source == DetectionSource.GLOBAL:
+            if row.source == DetectionSource.GLOBAL or row.detection_status == new_status:
                 skipped += 1
                 continue
-            if (
-                new_status == DetectionStatus.DEPLOYED
-                and row.detection_status != DetectionStatus.DEPLOYED
-                and review_status_value(row.review_status)
-                != "approved"
-            ):
+            if new_status == DetectionStatus.DEPLOYED and deployment_block_reason(row):
                 blocked += 1
                 continue
+            purpose = _required_change_reason(payload.change_reason)
+            before = snapshot(row)
+            changes = field_changes(before, {"detection_status": new_status})
             row.detection_status = new_status
+            await append_version(
+                session, row, before=before, changes=changes, actor=_principal.user,
+                reason=purpose, source="bulk",
+            )
             updated += 1
     return BulkResultOut(updated=updated, skipped=skipped, blocked=blocked)
 
@@ -1087,6 +1110,7 @@ async def promote_suggestion(
             source_detection_id=payload.source_detection_id,
             target_codename=principal.customer.codename,
             scope=principal.deployment,
+            actor=principal.user,
         )
     except ValueError as e:
         msg = str(e)

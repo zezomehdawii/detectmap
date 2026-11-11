@@ -347,6 +347,8 @@ class DetectionRefOut(BaseModel):
     score_depth: int
     level: Optional[str]
     upstream_global_id: Optional[str]
+    version: int
+    review_status: str
 
 
 class TechniqueNoteOut(BaseModel):

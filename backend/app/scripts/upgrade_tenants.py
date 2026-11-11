@@ -2,6 +2,7 @@
 
     python -m app.scripts.upgrade_tenants --customer lab01
     python -m app.scripts.upgrade_tenants --customer lab01 --customer lab02 --apply
+    python -m app.scripts.upgrade_tenants --all --apply
 
 Without --apply, lists the registered tenant/schema targets only.
 """
@@ -16,33 +17,44 @@ from sqlalchemy import select, text
 from app.db.base import AsyncSessionLocal
 from app.db.tenant import schema_for
 from app.models.public import Customer
-from app.services.provisioning import _run_customer_migrations
+from app.services.provisioning import _migrate_in_transaction
 
 
-async def upgrade(customers: list[str], *, apply: bool = False) -> list[dict]:
-    names = list(dict.fromkeys(customers))
+async def upgrade(customers: list[str] | None, *, apply: bool = False) -> list[dict]:
     targets = []
     # Validate the full target list before applying any migrations.
     async with AsyncSessionLocal() as session:
+        registered = (await session.scalars(select(Customer.codename).order_by(Customer.codename))).all()
+        names = dict.fromkeys(registered if customers is None else customers)
         for name in names:
             schema = schema_for(name)
-            matches = (await session.execute(select(Customer).where(Customer.codename == name))).scalars().all()
-            if len(matches) != 1:
+            if customers is not None and registered.count(name) != 1:
                 raise ValueError(f"customer codename must identify exactly one registered customer: {name}")
-            exists = (await session.execute(text("SELECT to_regnamespace(:schema)"), {"schema": schema})).scalar_one_or_none()
+            exists = await session.scalar(text("SELECT to_regnamespace(:schema)"), {"schema": schema})
             if exists is None:
+                if customers is None:
+                    continue  # Failed or pending provisioning may have no schema yet.
                 raise ValueError(f"missing schema: {schema}; provision the customer first")
             targets.append({"customer": name, "schema": schema, "applied": False})
-    for target in targets:
-        if apply:
-            await _run_customer_migrations(target["schema"])
+    if apply:
+        for target in targets:
+            schema = target["schema"]
+            async with AsyncSessionLocal.begin() as session:
+                await session.execute(
+                    text("SELECT pg_advisory_xact_lock(hashtext('detectmap:tenant-migrations'), hashtext(:schema))"),
+                    {"schema": schema},
+                )
+                connection = await session.connection()
+                await connection.run_sync(_migrate_in_transaction, schema)
             target["applied"] = True
     return targets
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--customer", action="append", required=True, help="Exact existing customer; repeat for multiple targets")
+    targets = parser.add_mutually_exclusive_group(required=True)
+    targets.add_argument("--customer", action="append", help="Exact existing customer; repeat for multiple targets")
+    targets.add_argument("--all", action="store_true", help="Every registered customer with an existing schema")
     parser.add_argument("--apply", action="store_true")
     args = parser.parse_args()
     try:

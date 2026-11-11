@@ -164,6 +164,7 @@ export interface MeResponse {
   mssp_org_id: string | null;
   must_change_password: boolean;
   can_write_assets?: boolean;
+  can_edit_detections?: boolean;
 }
 
 export interface LoginResponse {
@@ -198,8 +199,8 @@ export async function login(
   return data;
 }
 
-export async function fetchMe(): Promise<MeResponse> {
-  const { data } = await api.get<MeResponse>('/auth/me');
+export async function fetchMe(customer?: string): Promise<MeResponse> {
+  const { data } = await api.get<MeResponse>('/auth/me', _cust(customer));
   return data;
 }
 
@@ -1130,6 +1131,19 @@ export interface DetectionListItem {
   techniques: string[];
   owner: string | null;
   review_status: string;
+  version: number;
+  last_changed_at: string;
+}
+
+export interface DetectionVersion {
+  version: number;
+  changed_at: string;
+  changed_by_user_id: string | null;
+  changed_by_email: string | null;
+  changed_by_name: string | null;
+  change_reason: string;
+  source: 'manual' | 'baseline' | 'created' | 'bulk';
+  changes: Record<string, { before: unknown; after: unknown }>;
 }
 
 export interface DetectionDetail extends DetectionListItem {
@@ -1186,9 +1200,23 @@ export async function getDetection(id: string): Promise<DetectionDetail> {
   return data;
 }
 
+export async function listDetectionVersions(id: string): Promise<DetectionVersion[]> {
+  const { data } = await api.get<DetectionVersion[]>(`/detections/${id}/history`);
+  return data;
+}
+
+export function isDetectionVersionConflict(err: unknown): boolean {
+  return axios.isAxiosError(err) &&
+    err.response?.status === 409 &&
+    _errorDetail(err) === 'This use case changed since you opened it. Reload it and try again.';
+}
+
 export async function patchDetection(
   id: string,
-  patch: Partial<{
+  patch: {
+    change_reason: string;
+    expected_version: number;
+  } & Partial<{
     detection_status: string;
     level: string;
     score_breadth: number;
@@ -1200,8 +1228,13 @@ export async function patchDetection(
     owner: string;
   }>,
 ): Promise<DetectionDetail> {
-  const { data } = await api.patch<DetectionDetail>(`/detections/${id}`, patch);
-  return data;
+  try {
+    const { data } = await api.patch<DetectionDetail>(`/detections/${id}`, patch);
+    return data;
+  } catch (err) {
+    if (isDetectionVersionConflict(err)) clearApiCache();
+    throw err;
+  }
 }
 
 export type DetectionReviewAction =
@@ -1217,13 +1250,16 @@ export async function reviewDetection(
     note?: string;
     reviewer_email?: string;
     review_due_at?: string;
+    expected_version?: number;
   },
 ): Promise<DetectionDetail> {
-  const { data } = await api.post<DetectionDetail>(
-    `/detections/${id}/review`,
-    payload,
-  );
-  return data;
+  try {
+    const { data } = await api.post<DetectionDetail>(`/detections/${id}/review`, payload);
+    return data;
+  } catch (err) {
+    if (isDetectionVersionConflict(err)) clearApiCache();
+    throw err;
+  }
 }
 
 export async function createDetection(payload: {
@@ -1246,10 +1282,12 @@ export interface BulkResult {
 export async function bulkDetectionStatus(
   ids: string[],
   detection_status: string,
+  change_reason: string,
 ): Promise<BulkResult> {
   const { data } = await api.post<BulkResult>('/detections/bulk-status', {
     ids,
     detection_status,
+    change_reason,
   });
   return data;
 }
@@ -1541,6 +1579,8 @@ export interface DetectionRef {
   score_depth: number;
   level: string | null;
   upstream_global_id: string | null;
+  version: number;
+  review_status: string;
 }
 
 export interface TechniqueNote {

@@ -134,6 +134,11 @@ class Detection(CustomerBase):
     review_due_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     review_note: Mapped[Optional[str]] = mapped_column(Text)
 
+    version: Mapped[int] = mapped_column(Integer, server_default="1", nullable=False)
+    last_changed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
@@ -147,6 +152,24 @@ class Detection(CustomerBase):
     technique_mappings: Mapped[list["DetectionTechnique"]] = relationship(
         back_populates="detection", cascade="all, delete-orphan"
     )
+
+
+class DetectionVersion(CustomerBase):
+    """An immutable revision of a rule's configuration within its tenant."""
+
+    __tablename__ = "detection_versions"
+
+    detection_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("detections.id", ondelete="CASCADE"), primary_key=True
+    )
+    version: Mapped[int] = mapped_column(Integer, primary_key=True)
+    changed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    changed_by_user_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True))
+    changed_by_email: Mapped[Optional[str]] = mapped_column(String(320))
+    changed_by_name: Mapped[Optional[str]] = mapped_column(String(200))
+    change_reason: Mapped[str] = mapped_column(Text, nullable=False)
+    source: Mapped[str] = mapped_column(String(20), nullable=False)
+    changes: Mapped[dict] = mapped_column(JSONB, nullable=False)
 
 
 class DetectionTechnique(CustomerBase):

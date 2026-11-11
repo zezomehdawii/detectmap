@@ -764,7 +764,9 @@ function DetectionLinkerDialog({
   // /assets/{id}/detections fetch + every search response. Used to
   // render titles/status/source in the "selected" panel even when an
   // item is no longer in view.
-  const [metaCache, setMetaCache] = useState<Record<string, DetectionListItem>>({});
+  const [metaCache, setMetaCache] = useState<
+    Record<string, Pick<DetectionListItem, 'title' | 'sigma_id' | 'detection_status'>>
+  >({});
 
   const [initialLoading, setInitialLoading] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -811,31 +813,16 @@ function DetectionLinkerDialog({
       .then((rows) => {
         if (cancelled) return;
         setPendingIds(new Set(rows.map((r) => r.detection_id)));
-        // Promote the linked-rule refs into the meta cache so the
-        // selected-panel shows titles immediately. The shape is
-        // slightly different from DetectionListItem (no level / score)
-        // but the fields we render — title, sigma_id, status, source,
-        // techniques — line up 1:1.
+        // Show the linked rule titles immediately, before the search completes.
         setMetaCache(
           Object.fromEntries(
             rows.map((r) => [
               r.detection_id,
               {
-                id: r.detection_id,
                 sigma_id: r.sigma_id,
                 title: r.title,
-                description: null,
                 detection_status: r.detection_status,
-                source: r.source,
-                level: null,
-                score_breadth: 0,
-                score_depth: 0,
-                upstream_global_id: null,
-                tags: [],
-                techniques: r.techniques,
-                owner: null,
-                review_status: 'draft',
-              } as DetectionListItem,
+              },
             ]),
           ),
         );

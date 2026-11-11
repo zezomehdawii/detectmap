@@ -27,19 +27,26 @@ import {
   Typography,
 } from '@mui/material';
 import CloseRoundedIcon from '@mui/icons-material/CloseRounded';
+import EditOutlinedIcon from '@mui/icons-material/EditOutlined';
 import FilterAltOffRoundedIcon from '@mui/icons-material/FilterAltOffRounded';
+import HistoryRoundedIcon from '@mui/icons-material/HistoryRounded';
 import {
   DetectionDetail,
   DetectionListItem,
+  apiErrorMessage,
   bulkDeleteDetections,
   bulkDetectionStatus,
   getDetection,
   listDetections,
   patchDetection,
 } from '@/lib/api';
-import { FeatureGate, useFeatures } from '@/lib/features';
+import { FeatureGate } from '@/lib/features';
 import { useDeployment } from '@/lib/deployment';
 import { useUserPrefs } from '@/lib/preferences';
+import { DetectionDrawerExtras, SuggestionsStrip } from './DetectionExtras';
+import { DetectionReviewPanel } from './ReviewPanel';
+import { ChangePurposeAction, ChangePurposeDialog, useCanEditDetections } from './UseCaseChange';
+import { ChangeDate, EditUseCaseDialog, UseCaseHistoryDialog } from './UseCaseTracker';
 
 const STATUS_OPTIONS = [
   'idea',
@@ -49,9 +56,6 @@ const STATUS_OPTIONS = [
   'gap',
   'not_applicable',
 ];
-import { DetectionDrawerExtras, SuggestionsStrip } from './DetectionExtras';
-import { DetectionReviewPanel } from './ReviewPanel';
-
 const SOURCE_LABELS: Record<string, { label: string; color: 'default' | 'primary' | 'success' | 'warning' }> = {
   global: { label: 'global', color: 'default' },
   customized: { label: 'customized', color: 'warning' },
@@ -224,8 +228,7 @@ const LEVEL_COLORS: Record<string, string> = {
 export default function DetectionsPage() {
   const singleEnvironment = useDeployment()?.mode === 'single';
   const searchParams = useSearchParams();
-  const { isEnabled } = useFeatures();
-  const canEdit = isEnabled('detection_editing');
+  const canEdit = useCanEditDetections();
   const { get: getPref } = useUserPrefs();
   const tableSize: 'small' | 'medium' =
     getPref<string>('density', 'comfortable') === 'compact' ? 'small' : 'medium';
@@ -244,9 +247,11 @@ export default function DetectionsPage() {
   const [reviewStatus, setReviewStatus] = useState('');
   const [techniqueId, setTechniqueId] = useState(searchParams.get('technique_id') ?? '');
 
-  const [openId, setOpenId] = useState<string | null>(null);
+  const linkedDetectionId = searchParams.get('id');
+  const [openId, setOpenId] = useState<string | null>(linkedDetectionId);
   const [detail, setDetail] = useState<DetectionDetail | null>(null);
-  const [detailLoading, setDetailLoading] = useState(false);
+  const [detailError, setDetailError] = useState<string | null>(null);
+  const [detailDialog, setDetailDialog] = useState<'edit' | 'history' | null>(null);
 
   // Selection + bulk actions
   const [selected, setSelected] = useState<Set<string>>(new Set());
@@ -254,7 +259,7 @@ export default function DetectionsPage() {
   const [bulkBusy, setBulkBusy] = useState(false);
   const [bulkMsg, setBulkMsg] = useState<string | null>(null);
   const [reloadKey, setReloadKey] = useState(0);
-  const [rowBusy, setRowBusy] = useState<string | null>(null);
+  const [changeAction, setChangeAction] = useState<ChangePurposeAction | null>(null);
 
   const pages = useMemo(
     () => Math.max(1, Math.ceil(total / pageSize)),
@@ -293,6 +298,25 @@ export default function DetectionsPage() {
     };
   }, [page, q, status, source, level, reviewStatus, techniqueId, reloadKey]);
 
+  useEffect(() => {
+    if (linkedDetectionId) {
+      setOpenId(linkedDetectionId);
+      setDetailDialog(null);
+    }
+  }, [linkedDetectionId]);
+
+  useEffect(() => {
+    if (!openId) return;
+    let active = true;
+    setDetailError(null);
+    getDetection(openId)
+      .then((data) => { if (active) setDetail(data); })
+      .catch((err) => { if (active) setDetailError(apiErrorMessage(err, 'Could not load the use case.')); });
+    return () => { active = false; };
+  }, [openId]);
+
+  const openDetection = detail?.id === openId ? detail : null;
+
   function toggleSelect(id: string) {
     setSelected((s) => {
       const next = new Set(s);
@@ -308,26 +332,25 @@ export default function DetectionsPage() {
     );
   }
 
-  async function applyBulkStatus() {
-    setBulkBusy(true);
-    setBulkMsg(null);
-    try {
-      const r = await bulkDetectionStatus([...selected], bulkStatus);
-      const parts = [`Updated ${r.updated}`];
-      if (r.skipped) parts.push(`skipped ${r.skipped} global`);
-      if (r.blocked) parts.push(`${r.blocked} blocked pending approval`);
-      setBulkMsg(`${parts.join(', ')}.`);
-      setSelected(new Set());
-      setReloadKey((k) => k + 1);
-    } catch (e: any) {
-      setBulkMsg(e?.response?.data?.detail ?? 'bulk update failed');
-    } finally {
-      setBulkBusy(false);
-    }
+  function confirmBulkStatus() {
+    const ids = [...selected];
+    setChangeAction({
+      title: 'Change status',
+      description: `Set ${ids.length} selected ${ids.length === 1 ? 'use case' : 'use cases'} to ${bulkStatus.replaceAll('_', ' ')}.`,
+      onSave: async (purpose) => {
+        const result = await bulkDetectionStatus(ids, bulkStatus, purpose);
+        const parts = [`Updated ${result.updated}`];
+        if (result.skipped) parts.push(`skipped ${result.skipped}`);
+        if (result.blocked) parts.push(`${result.blocked} blocked pending approval`);
+        setBulkMsg(`${parts.join(', ')}.`);
+        setSelected(new Set());
+        setReloadKey((k) => k + 1);
+      },
+    });
   }
 
   async function applyBulkDelete() {
-    if (!confirm(`Delete ${selected.size} detection(s)? Global rules are skipped.`)) return;
+    if (!confirm(`Delete ${selected.size} detection(s) and their version history? Global rules are skipped.`)) return;
     setBulkBusy(true);
     setBulkMsg(null);
     try {
@@ -342,26 +365,42 @@ export default function DetectionsPage() {
     }
   }
 
-  async function inlineStatus(id: string, newStatus: string) {
-    setRowBusy(id);
-    setBulkMsg(null);
-    try {
-      await patchDetection(id, { detection_status: newStatus });
-      setReloadKey((k) => k + 1);
-    } catch (e: any) {
-      setBulkMsg(e?.response?.data?.detail ?? 'status update failed');
-    } finally {
-      setRowBusy(null);
-    }
+  function confirmStatus(detection: DetectionListItem, newStatus: string) {
+    if (detection.detection_status === newStatus) return;
+    setChangeAction({
+      title: 'Change status',
+      description: `Set ${detection.title} to ${newStatus.replaceAll('_', ' ')}.`,
+      onSave: async (purpose) => {
+        const updated = await patchDetection(detection.id, {
+          detection_status: newStatus,
+          change_reason: purpose,
+          expected_version: detection.version,
+        });
+        setItems((current) => current.map((item) => item.id === updated.id ? updated : item));
+        setReloadKey((k) => k + 1);
+      },
+      onReload: () => setReloadKey((k) => k + 1),
+    });
   }
 
   function openDetail(id: string) {
     setOpenId(id);
+    setDetailError(null);
+    setDetailDialog(null);
+  }
+
+  function closeDetail() {
+    setOpenId(null);
     setDetail(null);
-    setDetailLoading(true);
-    getDetection(id)
-      .then((d) => setDetail(d))
-      .finally(() => setDetailLoading(false));
+    setDetailError(null);
+    setDetailDialog(null);
+  }
+
+  function detectionChanged(next: DetectionDetail, sourceId = next.id) {
+    setDetail((current) => current?.id === sourceId ? next : current);
+    setOpenId((current) => current === sourceId ? next.id : current);
+    setItems((current) => current.map((item) => item.id === next.id ? next : item));
+    setReloadKey((k) => k + 1);
   }
 
   function resetFilters() {
@@ -518,7 +557,7 @@ export default function DetectionsPage() {
             <Button
               variant="contained"
               size="small"
-              onClick={applyBulkStatus}
+              onClick={confirmBulkStatus}
               disabled={bulkBusy || selected.size === 0 || !canEdit}
             >
               Apply
@@ -606,11 +645,18 @@ export default function DetectionsPage() {
                         />
                       </TableCell>
                       <TableCell>
-                        <Typography variant="body2" sx={{ fontWeight: 500 }}>
+                        <Button
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            openDetail(d.id);
+                          }}
+                          sx={{ px: 0, py: 0, fontWeight: 500, textAlign: 'left', textTransform: 'none', color: 'text.primary' }}
+                        >
                           {d.title}
-                        </Typography>
-                        <Typography variant="caption" color="text.secondary" sx={{ fontFamily: 'monospace' }}>
+                        </Button>
+                        <Typography variant="caption" color="text.secondary" sx={{ display: 'block', fontFamily: 'monospace' }}>
                           {d.sigma_id.slice(0, 8)}…
+                          {d.source !== 'global' && ` · v${d.version}`}
                         </Typography>
                       </TableCell>
                       <TableCell>
@@ -630,8 +676,8 @@ export default function DetectionsPage() {
                             size="small"
                             variant="standard"
                             value={d.detection_status}
-                            disabled={rowBusy === d.id || !canEdit}
-                            onChange={(e) => inlineStatus(d.id, e.target.value)}
+                            disabled={!canEdit}
+                            onChange={(e) => confirmStatus(d, e.target.value)}
                             sx={{ minWidth: 130 }}
                           >
                             {STATUS_OPTIONS.map((s) => {
@@ -731,44 +777,53 @@ export default function DetectionsPage() {
       <Drawer
         anchor="right"
         open={openId !== null}
-        onClose={() => {
-          setOpenId(null);
-          setDetail(null);
-        }}
+        onClose={closeDetail}
         PaperProps={{ sx: { width: { xs: '100%', md: 640 } } }}
       >
         <Box sx={{ p: 3, display: 'flex', flexDirection: 'column', gap: 2 }}>
           <Stack direction="row" alignItems="center" spacing={1}>
             <Typography variant="h6" sx={{ flex: 1, fontWeight: 700 }}>
-              {detail?.title ?? 'Loading…'}
+              {openDetection?.title ?? 'Use case'}
             </Typography>
-            <IconButton onClick={() => setOpenId(null)} size="small">
+            <IconButton onClick={closeDetail} size="small" aria-label="Close use case">
               <CloseRoundedIcon />
             </IconButton>
           </Stack>
-          {detailLoading && <CircularProgress size={20} />}
-          {detail && (
+          {detailError && <Alert severity="error">{detailError}</Alert>}
+          {!openDetection && !detailError && <CircularProgress size={20} aria-label="Loading use case" />}
+          {openDetection && (
             <>
               <Stack direction="row" spacing={1} flexWrap="wrap" useFlexGap>
-                <Chip label={detail.source} size="small" color={SOURCE_LABELS[detail.source]?.color ?? 'default'} />
+                <Chip label={openDetection.source} size="small" color={SOURCE_LABELS[openDetection.source]?.color ?? 'default'} />
                 <Chip
-                  label={detail.detection_status.replace('_', ' ')}
+                  label={openDetection.detection_status.replace('_', ' ')}
                   size="small"
                   variant="outlined"
                 />
-                {detail.level && <Chip label={detail.level} size="small" />}
-                {detail.sigma_status && <Chip label={detail.sigma_status} size="small" variant="outlined" />}
+                {openDetection.level && <Chip label={openDetection.level} size="small" />}
+                {openDetection.sigma_status && <Chip label={openDetection.sigma_status} size="small" variant="outlined" />}
+                <Chip label={`Version ${openDetection.version}`} size="small" variant="outlined" />
+              </Stack>
+              <Stack direction="row" spacing={1} alignItems="center" flexWrap="wrap" useFlexGap>
+                {canEdit && (
+                  <Button variant="contained" size="small" startIcon={<EditOutlinedIcon />} onClick={() => setDetailDialog('edit')}>
+                    {openDetection.source === 'global' ? 'Customize use case' : 'Edit use case'}
+                  </Button>
+                )}
+                <Button variant="outlined" size="small" startIcon={<HistoryRoundedIcon />} onClick={() => setDetailDialog('history')}>
+                  Version history
+                </Button>
+                <Typography variant="caption" color="text.secondary">
+                  Last changed <ChangeDate value={openDetection.last_changed_at} />
+                </Typography>
               </Stack>
               <DetectionReviewPanel
-                detail={detail}
+                detail={openDetection}
                 canEdit={canEdit}
-                onChanged={(next) => {
-                  setDetail(next);
-                  setReloadKey((k) => k + 1);
-                }}
+                onChanged={detectionChanged}
               />
               <Typography variant="body2" color="text.secondary">
-                {detail.description ?? '(no description)'}
+                {openDetection.description ?? '(no description)'}
               </Typography>
               <Divider />
               <Box>
@@ -776,12 +831,12 @@ export default function DetectionsPage() {
                   Techniques
                 </Typography>
                 <Stack direction="row" spacing={0.5} flexWrap="wrap" useFlexGap sx={{ mt: 0.5 }}>
-                  {detail.techniques.length === 0 && (
+                  {openDetection.techniques.length === 0 && (
                     <Typography variant="caption" color="text.secondary">
                       —
                     </Typography>
                   )}
-                  {detail.techniques.map((t) => (
+                  {openDetection.techniques.map((t) => (
                     <Chip
                       key={t}
                       label={t}
@@ -796,7 +851,7 @@ export default function DetectionsPage() {
                   Tags
                 </Typography>
                 <Stack direction="row" spacing={0.5} flexWrap="wrap" useFlexGap sx={{ mt: 0.5 }}>
-                  {detail.tags.map((t) => (
+                  {openDetection.tags.map((t) => (
                     <Chip key={t} label={t} size="small" variant="outlined" />
                   ))}
                 </Stack>
@@ -805,23 +860,37 @@ export default function DetectionsPage() {
                 <Typography variant="caption" color="text.secondary">
                   Sigma YAML
                 </Typography>
-                <SigmaYamlBlock yaml={detail.raw_yaml ?? '(no YAML)'} />
+                <SigmaYamlBlock yaml={openDetection.raw_yaml ?? '(no YAML)'} />
               </Box>
               <Box>
                 <Button
                   size="small"
                   variant="outlined"
-                  href={`${process.env.NEXT_PUBLIC_API_BASE ?? 'http://localhost:8000'}/detections/${detail.id}/export`}
+                  href={`${process.env.NEXT_PUBLIC_API_BASE ?? 'http://localhost:8000'}/detections/${openDetection.id}/export`}
                 >
                   Download YAML
                 </Button>
               </Box>
               <Divider />
-              <DetectionDrawerExtras detectionId={detail.id} />
+              <DetectionDrawerExtras detectionId={openDetection.id} />
+              {detailDialog === 'edit' && canEdit && (
+                <EditUseCaseDialog
+                  key={`${openDetection.id}:${openDetection.version}`}
+                  detail={openDetection}
+                  onClose={() => setDetailDialog(null)}
+                  onChanged={(next) => detectionChanged(next, openDetection.id)}
+                />
+              )}
+              {detailDialog === 'history' && (
+                <UseCaseHistoryDialog detail={openDetection} onClose={() => setDetailDialog(null)} />
+              )}
             </>
           )}
         </Box>
       </Drawer>
+      {changeAction && canEdit && (
+        <ChangePurposeDialog action={changeAction} onClose={() => setChangeAction(null)} />
+      )}
     </Box>
   );
 }

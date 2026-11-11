@@ -26,7 +26,7 @@ from app.core.security import (
 from app.db.base import AsyncSessionLocal
 from app.models.public import AppSettings, Customer, MSSPOrg, Role, SuperAdmin, User
 from app.services import customer_features
-from app.services.deployment import load_scope
+from app.services.deployment import SAMPLE_DISABLED_FEATURES, load_scope
 from app.services.roles import user_has_permission
 
 log = logging.getLogger(__name__)
@@ -135,6 +135,7 @@ class MeResponse(BaseModel):
     mssp_org_id: str | None
     must_change_password: bool = False
     can_write_assets: bool = False
+    can_edit_detections: bool = False
 
 
 class LoginHintOut(BaseModel):
@@ -297,6 +298,15 @@ async def me(principal: TenantPrincipal = Depends(current_tenant_user)) -> MeRes
         ),
         must_change_password=principal.user.must_change_password,
         can_write_assets=await user_has_permission(principal.user, Permission.ASSET_WRITE),
+        can_edit_detections=(
+            principal.customer is not None
+            and customer_features.is_enabled(principal.customer.features, "detection_editing")
+            and not (
+                principal.customer.sample_dataset is not None
+                and "detection_editing" in SAMPLE_DISABLED_FEATURES
+            )
+            and await user_has_permission(principal.user, Permission.DETECTION_WRITE)
+        ),
     )
 
 

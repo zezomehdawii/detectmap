@@ -1,6 +1,7 @@
 'use client';
 
 import { useCallback, useEffect, useMemo, useState } from 'react';
+import { usePathname } from 'next/navigation';
 import {
   Alert,
   Autocomplete,
@@ -67,6 +68,7 @@ import {
   CoverageSnapshot,
   CustomDenominatorSpec,
   DeltaChange,
+  DetectionRef,
   GRCFrameworkSummary,
   MatrixDelta,
   MatrixDeltaCell,
@@ -100,6 +102,7 @@ import {
 import Link from 'next/link';
 import AutoAwesomeRoundedIcon from '@mui/icons-material/AutoAwesomeRounded';
 import { coverage } from '../../theme';
+import { ChangePurposeAction, ChangePurposeDialog, useCanEditDetections } from '../detections/UseCaseChange';
 
 type DenominatorKind = 'full' | 'sector' | 'apt' | 'custom';
 type SubTechScope = 'all' | 'parents' | 'subs';
@@ -1826,13 +1829,15 @@ function TechniqueDrawer({
   onClose: () => void;
   onCellRefresh: () => void;
 }) {
+  const canEdit = useCanEditDetections();
+  const detectionsPath = usePathname().startsWith('/portal/') ? '/portal/detections' : '/dashboard/detections';
   const [detail, setDetail] = useState<TechniqueDetail | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [noteInput, setNoteInput] = useState('');
   const [editingNote, setEditingNote] = useState(false);
   const [savingNote, setSavingNote] = useState(false);
-  const [savingDetectionId, setSavingDetectionId] = useState<string | null>(null);
+  const [statusAction, setStatusAction] = useState<ChangePurposeAction | null>(null);
   const [aiOpen, setAiOpen] = useState(false);
 
   useEffect(() => {
@@ -1842,6 +1847,7 @@ function TechniqueDrawer({
     setDetail(null);
     setEditingNote(false);
     setAiOpen(false);
+    setStatusAction(null);
     getTechniqueDetail(cell.technique_id)
       .then((d) => {
         if (cancelled) return;
@@ -1887,28 +1893,28 @@ function TechniqueDrawer({
     }
   }
 
-  async function quickEditStatus(detectionId: string, nextStatus: string) {
-    setSavingDetectionId(detectionId);
-    try {
-      await patchDetection(detectionId, { detection_status: nextStatus });
-      setDetail((d) => {
-        if (!d) return d;
-        return {
-          ...d,
-          detections: d.detections.map((det) =>
-            det.id === detectionId
-              ? { ...det, detection_status: nextStatus }
-              : det,
-          ),
-        };
-      });
-      // The matrix cell color depends on detection status — re-fetch.
-      onCellRefresh();
-    } catch (e: any) {
-      setError(e?.response?.data?.detail ?? 'failed to update detection');
-    } finally {
-      setSavingDetectionId(null);
-    }
+  function confirmStatusChange(detection: DetectionRef, nextStatus: string) {
+    if (detection.detection_status === nextStatus) return;
+    const status = DETECTION_STATUS_LABEL[nextStatus];
+    setStatusAction({
+      title: 'Change status',
+      description: detection.source === 'global'
+        ? `Save a workspace copy of ${detection.title} with status ${status}.`
+        : `Set ${detection.title} to ${status}.`,
+      onSave: async (purpose) => {
+        const updated = await patchDetection(detection.id, {
+          detection_status: nextStatus,
+          change_reason: purpose,
+          expected_version: detection.version,
+        });
+        setDetail((current) => current ? {
+          ...current,
+          detections: current.detections.map((item) => item.id === detection.id ? updated : item),
+        } : current);
+        onCellRefresh();
+      },
+      onReload: async () => setDetail(await getTechniqueDetail(cell.technique_id)),
+    });
   }
 
   const draftDetectionHref = `/dashboard/detections?draft_for=${encodeURIComponent(cell.technique_id)}`;
@@ -2097,15 +2103,22 @@ function TechniqueDrawer({
                   select
                   size="small"
                   value={d.detection_status}
-                  onChange={(e) => quickEditStatus(d.id, e.target.value)}
-                  disabled={savingDetectionId === d.id}
+                  onChange={(e) => confirmStatusChange(d, e.target.value)}
+                  disabled={!canEdit}
                   sx={{ minWidth: 160 }}
                 >
-                  {DETECTION_STATUS_OPTIONS.map((s) => (
-                    <MenuItem key={s} value={s}>
-                      {DETECTION_STATUS_LABEL[s]}
-                    </MenuItem>
-                  ))}
+                  {DETECTION_STATUS_OPTIONS.map((s) => {
+                    const needsApproval =
+                      s === 'deployed' &&
+                      d.detection_status !== 'deployed' &&
+                      (d.source === 'global' || d.review_status !== 'approved');
+                    return (
+                      <MenuItem key={s} value={s} disabled={needsApproval}>
+                        {DETECTION_STATUS_LABEL[s]}
+                        {needsApproval ? ' (approval required)' : ''}
+                      </MenuItem>
+                    );
+                  })}
                 </TextField>
                 <Tooltip title="Depth score (DeTT&CT A-D, 0–5)">
                   <Chip
@@ -2126,7 +2139,8 @@ function TechniqueDrawer({
                   <IconButton
                     size="small"
                     component={MuiLink}
-                    href={`/dashboard/detections?id=${d.id}`}
+                    href={`${detectionsPath}?id=${d.id}`}
+                    aria-label="Open in detection library"
                   >
                     <OpenInNewRoundedIcon fontSize="small" />
                   </IconButton>
@@ -2135,6 +2149,9 @@ function TechniqueDrawer({
             </Box>
           ))}
         </Stack>
+      )}
+      {statusAction && canEdit && (
+        <ChangePurposeDialog action={statusAction} onClose={() => setStatusAction(null)} />
       )}
 
       {/* APT groups */}

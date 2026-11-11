@@ -17,9 +17,12 @@ import {
   DetectionDetail,
   DetectionReviewAction,
   apiErrorMessage,
+  getDetection,
+  isDetectionVersionConflict,
   patchDetection,
   reviewDetection,
 } from '@/lib/api';
+import { ChangePurposeAction, ChangePurposeDialog } from './UseCaseChange';
 
 const REVIEW_META: Record<
   string,
@@ -72,10 +75,12 @@ export function DetectionReviewPanel({
   const editable = canEdit && detail.source !== 'global';
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [stale, setStale] = useState(false);
   const [owner, setOwner] = useState(detail.owner ?? '');
   const [note, setNote] = useState('');
   const [reviewer, setReviewer] = useState('');
   const [dueDate, setDueDate] = useState('');
+  const [ownerAction, setOwnerAction] = useState<ChangePurposeAction | null>(null);
 
   // Reset the form when the drawer switches to another detection, and keep the
   // owner field in sync when a save returns a fresh row.
@@ -85,6 +90,8 @@ export function DetectionReviewPanel({
     setReviewer('');
     setDueDate(dateInputValue(detail.review_due_at));
     setError(null);
+    setStale(false);
+    setOwnerAction(null);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [detail.id]);
 
@@ -111,6 +118,7 @@ export function DetectionReviewPanel({
   async function act(action: DetectionReviewAction) {
     setBusy(action);
     setError(null);
+    setStale(false);
     try {
       const next = await reviewDetection(detail.id, {
         action,
@@ -118,27 +126,46 @@ export function DetectionReviewPanel({
         reviewer_email: reviewer.trim() || undefined,
         review_due_at:
           action === 'submit' ? dateInputToIso(dueDate) : undefined,
+        expected_version: detail.version,
       });
       setNote('');
       onChanged(next);
     } catch (e) {
+      setStale(isDetectionVersionConflict(e));
       setError(apiErrorMessage(e, 'review action failed'));
     } finally {
       setBusy(null);
     }
   }
 
-  async function saveOwner() {
-    setBusy('owner');
-    setError(null);
+  async function reload() {
+    setBusy('reload');
     try {
-      const next = await patchDetection(detail.id, { owner: owner.trim() });
-      onChanged(next);
-    } catch (e) {
-      setError(apiErrorMessage(e, 'failed to save owner'));
+      onChanged(await getDetection(detail.id));
+      setError(null);
+      setStale(false);
+    } catch (err) {
+      setError(apiErrorMessage(err, 'Could not reload the use case.'));
     } finally {
       setBusy(null);
     }
+  }
+
+  function confirmOwnerChange() {
+    const nextOwner = owner.trim();
+    setOwnerAction({
+      title: 'Change owner',
+      description: nextOwner ? `Assign this use case to ${nextOwner}.` : 'Clear the owner of this use case.',
+      onSave: async (purpose) => {
+        const next = await patchDetection(detail.id, {
+          owner: nextOwner,
+          change_reason: purpose,
+          expected_version: detail.version,
+        });
+        onChanged(next);
+      },
+      onReload: async () => onChanged(await getDetection(detail.id)),
+    });
   }
 
   return (
@@ -173,6 +200,7 @@ export function DetectionReviewPanel({
           size="small"
           value={owner}
           onChange={(e) => setOwner(e.target.value)}
+          inputProps={{ maxLength: 200 }}
           disabled={!editable || busy !== null}
           fullWidth
         />
@@ -180,7 +208,7 @@ export function DetectionReviewPanel({
           <Button
             size="small"
             variant="outlined"
-            onClick={saveOwner}
+            onClick={confirmOwnerChange}
             disabled={busy !== null || owner.trim() === (detail.owner ?? '').trim()}
             sx={{ mt: { xs: 0, sm: 0.25 }, whiteSpace: 'nowrap' }}
           >
@@ -302,7 +330,15 @@ export function DetectionReviewPanel({
       )}
 
       {error && (
-        <Alert severity="error" sx={{ mt: 1.25 }}>
+        <Alert
+          severity="error"
+          sx={{ mt: 1.25 }}
+          action={stale ? (
+            <Button color="inherit" size="small" onClick={reload} disabled={busy !== null}>
+              Reload latest version
+            </Button>
+          ) : undefined}
+        >
           {error}
         </Alert>
       )}
@@ -328,6 +364,9 @@ export function DetectionReviewPanel({
             ))}
           </Stack>
         </>
+      )}
+      {ownerAction && editable && (
+        <ChangePurposeDialog action={ownerAction} onClose={() => setOwnerAction(null)} />
       )}
     </Paper>
   );

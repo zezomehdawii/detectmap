@@ -39,6 +39,7 @@ services:
       - ./backend:/app
     command: >
       sh -c "alembic -n public upgrade head &&
+             python -m app.scripts.upgrade_tenants --all --apply &&
              uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload"
 
   worker:

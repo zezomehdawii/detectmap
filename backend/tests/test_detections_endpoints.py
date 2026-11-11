@@ -6,7 +6,9 @@ from a clean slate.
 """
 from __future__ import annotations
 
+import asyncio
 import uuid
+from datetime import datetime
 
 import pytest
 import pytest_asyncio
@@ -131,11 +133,11 @@ async def _post_global_row_directly() -> str:
         set_tenant(None)
 
 
-def _client(token: str):
+def _client(token: str, codename: str = "acme"):
     return AsyncClient(
         transport=ASGITransport(app=app),
         base_url="http://test",
-        headers={"Authorization": f"Bearer {token}", "X-Customer": "acme"},
+        headers={"Authorization": f"Bearer {token}", "X-Customer": codename},
     )
 
 
@@ -185,7 +187,7 @@ class TestDetectionsCRUD:
             det_id = r.json()["id"]
             r2 = await c.patch(
                 f"/detections/{det_id}",
-                json={"detection_status": "tuning", "score_breadth": 3},
+                json={"detection_status": "tuning", "score_breadth": 3, "change_reason": "Test rule update."},
             )
         assert r2.status_code == 200
         body = r2.json()
@@ -202,7 +204,7 @@ class TestDetectionsCRUD:
         async with _client(demo_admin_token) as c:
             r = await c.patch(
                 f"/detections/{global_id}",
-                json={"detection_status": "tuning", "score_breadth": 5},
+                json={"detection_status": "tuning", "score_breadth": 5, "change_reason": "Test rule update."},
             )
         assert r.status_code == 200
         body = r.json()
@@ -303,7 +305,7 @@ class TestDetectionReviewGate:
 
             r = await c.patch(
                 f"/detections/{det['id']}",
-                json={"detection_status": "deployed"},
+                json={"detection_status": "deployed", "change_reason": "Test rule update."},
             )
             assert r.status_code == 409
             assert "Approval required" in r.json()["detail"]
@@ -324,7 +326,7 @@ class TestDetectionReviewGate:
 
             r = await c.patch(
                 f"/detections/{det['id']}",
-                json={"detection_status": "deployed"},
+                json={"detection_status": "deployed", "change_reason": "Test rule update."},
             )
             assert r.status_code == 409
 
@@ -339,7 +341,7 @@ class TestDetectionReviewGate:
 
             r = await c.patch(
                 f"/detections/{det['id']}",
-                json={"detection_status": "deployed"},
+                json={"detection_status": "deployed", "change_reason": "Test rule update."},
             )
             assert r.status_code == 200
             assert r.json()["detection_status"] == "deployed"
@@ -353,13 +355,13 @@ class TestDetectionReviewGate:
             assert (await _review(c, det["id"], "approve")).status_code == 200
             r = await c.patch(
                 f"/detections/{det['id']}",
-                json={"detection_status": "deployed"},
+                json={"detection_status": "deployed", "change_reason": "Test rule update."},
             )
             assert r.status_code == 200
 
             r = await c.patch(
                 f"/detections/{det['id']}",
-                json={"score_depth": 4},
+                json={"score_depth": 4, "change_reason": "Test rule update."},
             )
             assert r.status_code == 200
             body = r.json()
@@ -369,12 +371,12 @@ class TestDetectionReviewGate:
 
             r = await c.patch(
                 f"/detections/{det['id']}",
-                json={"detection_status": "tuning"},
+                json={"detection_status": "tuning", "change_reason": "Test rule update."},
             )
             assert r.status_code == 200
             r = await c.patch(
                 f"/detections/{det['id']}",
-                json={"detection_status": "deployed"},
+                json={"detection_status": "deployed", "change_reason": "Test rule update."},
             )
             assert r.status_code == 409
 
@@ -390,6 +392,7 @@ class TestDetectionReviewGate:
                 json={
                     "detection_status": "deployed",
                     "description": "edited at promotion time",
+                    "change_reason": "Roll out revised rule.",
                 },
             )
             assert r.status_code == 409
@@ -456,7 +459,7 @@ class TestDetectionReviewGate:
             assert (await _review(c, det["id"], "approve")).status_code == 200
             r = await c.patch(
                 f"/detections/{det['id']}",
-                json={"owner": "soc-owner@example.com"},
+                json={"owner": "soc-owner@example.com", "change_reason": "Test rule update."},
             )
             assert r.status_code == 200
             body = r.json()
@@ -489,13 +492,13 @@ class TestDetectionReviewGate:
         async with _client(demo_admin_token) as c:
             r = await c.patch(
                 f"/detections/{global_id}",
-                json={"detection_status": "deployed"},
+                json={"detection_status": "deployed", "change_reason": "Test rule update."},
             )
             assert r.status_code == 409
 
             r = await c.patch(
                 f"/detections/{global_id}",
-                json={"detection_status": "tuning"},
+                json={"detection_status": "tuning", "change_reason": "Test rule update."},
             )
             assert r.status_code == 200
             cloned = r.json()
@@ -505,7 +508,7 @@ class TestDetectionReviewGate:
             assert (await _review(c, cloned["id"], "approve")).status_code == 200
             r = await c.patch(
                 f"/detections/{cloned['id']}",
-                json={"detection_status": "deployed"},
+                json={"detection_status": "deployed", "change_reason": "Test rule update."},
             )
             assert r.status_code == 200
 
@@ -533,6 +536,7 @@ class TestDetectionReviewGate:
                 json={
                     "ids": [approved["id"], pending["id"]],
                     "detection_status": "deployed",
+                    "change_reason": "Roll out the approved batch.",
                 },
             )
             assert r.status_code == 200
@@ -563,3 +567,180 @@ class TestDetectionReviewGate:
 
             r = await c.get("/detections?review_status=not-a-state")
             assert r.status_code == 422
+
+
+class TestDetectionVersions:
+    async def test_change_records_attribution_timestamp_and_diff(
+        self, acme_clean, demo_admin_token
+    ) -> None:
+        async with _client(demo_admin_token) as c:
+            det = await _create(c)
+            path = f"/detections/{det['id']}"
+            who = (await c.get("/auth/me")).json()
+            assert who["can_edit_detections"] is True
+            assert det["version"] == 1
+            assert (await c.get("/detections")).json()["items"][0]["version"] == 1
+
+            edited = await c.patch(
+                path,
+                json={
+                    "raw_yaml": SAMPLE_RULE.replace("level: high", "level: low"),
+                    "score_depth": 2,
+                    "change_reason": "  Reduce severity for non-production endpoints.  ",
+                    "expected_version": 1,
+                },
+            )
+            assert edited.status_code == 200, edited.text
+            current = edited.json()
+            assert current["version"] == 2
+            assert current["level"] == "low"
+            response = await c.get(f"{path}/history")
+
+        assert response.status_code == 200
+        change, created = response.json()
+        assert [change["version"], created["version"]] == [2, 1]
+        assert created["source"] == "created"
+        assert created["changes"]["level"] == {"before": None, "after": "high"}
+        assert change["source"] == "manual"
+        assert change["changed_by_user_id"] == who["user_id"]
+        assert change["changed_by_email"] == who["email"]
+        assert change["change_reason"] == "Reduce severity for non-production endpoints."
+        assert change["changed_at"] == current["last_changed_at"]
+        assert datetime.fromisoformat(change["changed_at"]) >= datetime.fromisoformat(
+            created["changed_at"]
+        )
+        assert change["changes"]["level"] == {"before": "high", "after": "low"}
+        assert change["changes"]["score_depth"] == {"before": 0, "after": 2}
+        assert set(change["changes"]) == {"raw_yaml", "level", "score_depth"}
+
+    async def test_requires_reason_for_real_change_and_preserves_approval_on_noop(
+        self, acme_clean, demo_admin_token
+    ) -> None:
+        async with _client(demo_admin_token) as c:
+            det = await _create(c)
+            path = f"/detections/{det['id']}"
+            assert (await _review(c, det["id"], "submit")).status_code == 200
+            assert (await _review(c, det["id"], "approve")).status_code == 200
+
+            missing = await c.patch(path, json={"score_depth": 2})
+            assert missing.status_code == 422
+            whitespace = await c.patch(path, json={"score_depth": 2, "change_reason": " \n "})
+            assert whitespace.status_code == 422
+            no_op = await c.patch(
+                path,
+                json={"raw_yaml": SAMPLE_RULE, "score_depth": 0, "expected_version": 1},
+            )
+            assert no_op.status_code == 200, no_op.text
+            assert no_op.json()["version"] == 1
+            assert no_op.json()["review_status"] == "approved"
+            assert no_op.json()["last_changed_at"] == det["last_changed_at"]
+            assert [event["version"] for event in (await c.get(f"{path}/history")).json()] == [1]
+
+    async def test_stale_concurrent_patch_does_not_overwrite(
+        self, acme_clean, demo_admin_token
+    ) -> None:
+        async with _client(demo_admin_token) as c:
+            det = await _create(c)
+            path = f"/detections/{det['id']}"
+            outcomes = await asyncio.gather(*(
+                c.patch(path, json={
+                    "owner": owner, "change_reason": "Assign rule owner.", "expected_version": 1,
+                })
+                for owner in ("Shift A", "Shift B")
+            ))
+            assert sorted(response.status_code for response in outcomes) == [200, 409]
+            winner = next(response.json() for response in outcomes if response.status_code == 200)
+            current = (await c.get(path)).json()
+            assert current["version"] == winner["version"] == 2
+            assert current["owner"] == winner["owner"]
+            change, created = (await c.get(f"{path}/history")).json()
+            assert [change["version"], created["version"]] == [2, 1]
+            assert change["changes"]["owner"] == {"before": None, "after": winner["owner"]}
+
+    async def test_review_rejects_stale_version(
+        self, acme_clean, demo_admin_token
+    ) -> None:
+        async with _client(demo_admin_token) as c:
+            det = await _create(c)
+            detection_id = det["id"]
+            assert (await _review(c, detection_id, "submit", expected_version=1)).status_code == 200
+            edited = await c.patch(
+                f"/detections/{detection_id}",
+                json={
+                    "score_depth": 2,
+                    "change_reason": "Update the depth score.",
+                    "expected_version": 1,
+                },
+            )
+            assert edited.status_code == 200, edited.text
+            assert (await _review(c, detection_id, "submit", expected_version=2)).status_code == 200
+            stale = await _review(c, detection_id, "approve", expected_version=1)
+            assert stale.status_code == 409
+            approved = await _review(c, detection_id, "approve", expected_version=2)
+            assert approved.status_code == 200
+            assert approved.json()["version"] == 2
+
+    async def test_global_customization_uses_independent_history(
+        self, acme_clean, demo_admin_token
+    ) -> None:
+        global_id = await _post_global_row_directly()
+        async with _client(demo_admin_token) as c:
+            path = f"/detections/{global_id}"
+            baseline = (await c.get(f"{path}/history")).json()
+            assert len(baseline) == 1
+            assert baseline[0]["source"] == "baseline"
+            assert baseline[0]["changed_by_user_id"] is None
+            assert (await c.patch(path, json={"score_depth": 0})).json()["id"] == global_id
+            forked = await c.patch(path, json={
+                "title": "Tenant-specific rule", "change_reason": "Document a local variant.",
+                "expected_version": 1,
+            })
+            assert forked.status_code == 200, forked.text
+            fork = forked.json()
+            assert fork["id"] != global_id
+            history = (await c.get(f"/detections/{fork['id']}/history")).json()
+            assert [event["version"] for event in history] == [2, 1]
+            assert history[0]["changes"]["title"] == {
+                "before": "Seeded Global Rule",
+                "after": "Tenant-specific rule",
+            }
+            assert history[1]["changes"]["title"]["after"] == "Seeded Global Rule"
+            assert (await c.get(f"{path}/history")).json() == baseline
+
+    async def test_bulk_status_history_and_noop(
+        self, acme_clean, demo_admin_token
+    ) -> None:
+        async with _client(demo_admin_token) as c:
+            first = await _create(c)
+            second = await _create(c, OTHER_RULE)
+            payload = {
+                "ids": [first["id"], second["id"]],
+                "detection_status": "tuning",
+            }
+            missing = await c.post("/detections/bulk-status", json=payload)
+            assert missing.status_code == 422
+            updated = await c.post("/detections/bulk-status", json={
+                **payload, "change_reason": "Start testing the new rule batch.",
+            })
+            assert updated.status_code == 200, updated.text
+            assert updated.json() == {"updated": 2, "skipped": 0, "blocked": 0}
+            noop = await c.post("/detections/bulk-status", json=payload)
+            assert noop.json() == {"updated": 0, "skipped": 2, "blocked": 0}
+            for det in (first, second):
+                change, created = (await c.get(f"/detections/{det['id']}/history")).json()
+                assert [change["version"], created["version"]] == [2, 1]
+                assert change["source"] == "bulk"
+                assert change["changes"] == {"detection_status": {"before": "idea", "after": "tuning"}}
+
+    async def test_history_permissions(self, acme_clean, demo_admin_token, demo_readonly_token) -> None:
+        async with _client(demo_admin_token) as c:
+            det = await _create(c)
+        path = f"/detections/{det['id']}"
+        async with _client(demo_readonly_token) as c:
+            assert (await c.get("/auth/me")).json()["can_edit_detections"] is False
+            assert (await c.get(f"{path}/history")).status_code == 200
+            denied = await c.patch(path, json={"owner": "Different team", "change_reason": "Test"})
+            assert denied.status_code == 403
+        async with _client(demo_admin_token, "globex") as c:
+            history = await c.get(f"{path}/history")
+            assert history.status_code == 404

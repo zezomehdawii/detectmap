@@ -23,8 +23,9 @@ from sqlalchemy import select
 from app.db.base import AsyncSessionLocal
 from app.db.tenant import set_tenant, tenant_session
 from app.models.customer import Detection, DetectionSource, DetectionStatus, DetectionTechnique
-from app.models.public import Customer
+from app.models.public import Customer, User
 from app.services.deployment import DeploymentScope
+from app.services.detection_versions import initial_version
 
 
 @dataclass
@@ -157,6 +158,7 @@ async def promote_to_active(
     source_detection_id: str,
     target_codename: str,
     scope: DeploymentScope = DeploymentScope(),
+    actor: User | None = None,
 ) -> dict:
     """Copy a detection from one sibling tenant to another within the same MSSP.
 
@@ -266,6 +268,12 @@ async def promote_to_active(
             )
             session.add(new_det)
             await session.flush()
+            session.add(initial_version(
+                new_det,
+                actor=actor,
+                reason=f"Imported use case from workspace '{source_codename}'.",
+                source="created",
+            ))
             for tid in src_snap["techniques"]:
                 session.add(
                     DetectionTechnique(

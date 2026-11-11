@@ -34,6 +34,7 @@ from app.models.public import (
     AttackTechniqueMitigation,
     D3FENDTechnique,
 )
+from app.services.detection_review import review_status_value
 
 
 @dataclass
@@ -62,6 +63,8 @@ class DetectionDetail:
     score_depth: int
     level: Optional[str]
     upstream_global_id: Optional[str]
+    version: int
+    review_status: str
 
 
 @dataclass
@@ -288,6 +291,8 @@ async def get_technique_detail(
                 score_depth=d.score_depth,
                 level=d.level.value if d.level else None,
                 upstream_global_id=d.upstream_global_id,
+                version=d.version,
+                review_status=review_status_value(d.review_status),
             )
             for d in det_rows
         ]
