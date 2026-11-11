@@ -34,48 +34,32 @@ sits on top of them.
 | **Settings** | AI authoring config, scheduled-refresh toggles (with run history), product branding, MSSP-portal user management, per-customer feature toggles, per-customer user management. |
 | **Collection management** | Requirements, collection plans, implemented-source links, validation notes, retention and data-quality inventory, ATT&CK visibility, JSON/CSV submissions, and tenant-pinned student access at `/portal/cmf`. See [CMF classroom setup](docs/CMF_CLASSROOM.md). |
 | **Customer profile** | Per-tenant assets (with criticality + compliance scope), asset↔detection linkage (search-and-multi-select picker), network/topology diagrams (image / PDF inline preview · binary download), emergency contacts. Read-only mirror at `/portal/organization` for customer users. |
-
----
-
-## Screenshots
-
-<!-- Drop PNG/JPG files into docs/screenshots/ with the filenames below.
-     The README references them once they exist; placeholder notes are
-     left in the meantime so the layout still reads cleanly. -->
-
-| Surface | Path |
-|---|---|
-| Login | `docs/screenshots/login.png` *(TODO: capture from `/login`)* |
-| Dashboard overview | `docs/screenshots/dashboard.png` *(TODO: capture from `/dashboard`)* |
-| Coverage matrix | `docs/screenshots/coverage-matrix.png` *(TODO: capture from `/dashboard/coverage`)* |
-| Technique drawer (detections + mitigations + D3FEND + note) | `docs/screenshots/technique-drawer.png` |
-| Detection library + drawer (effectiveness + samples + AI authoring) | `docs/screenshots/detection-drawer.png` |
-| APT coverage | `docs/screenshots/apt-coverage.png` |
-| Gap analysis | `docs/screenshots/gap-analysis.png` |
-| GRC crosswalk + control drawer | `docs/screenshots/grc-control.png` |
-| Reports & exports | `docs/screenshots/reports.png` |
-| Customer profile (assets · diagrams · contacts) | `docs/screenshots/customer-profile.png` |
-| Detection linker (search + multi-select) | `docs/screenshots/detection-linker.png` |
-| Portal — customer view (`/portal`) | `docs/screenshots/portal-overview.png` |
-| Portal — organization mirror | `docs/screenshots/portal-organization.png` |
-| Settings — AI authoring | `docs/screenshots/settings-ai.png` |
-| Settings — schedule | `docs/screenshots/settings-schedule.png` |
-
-> Screenshots are not embedded yet. Drop the PNGs into the paths above and
-> the next README pass will inline them — or replace each line with
-> `![label](docs/screenshots/<file>.png)` directly.
+| **Asset discovery** | Preview endpoints from an uploaded PCAP or PCAPNG, then add selected assets to the active workspace. |
 
 ---
 
 ## Quickstart
 
+### Clone Detect Map from GitHub
+
+Install **Git** and **Python 3.10+**, then open a terminal in the folder where
+you want to keep Detect Map. Clone the public repository and enter it:
+
+```bash
+git clone https://github.com/zezomehdawii/detectmap.git
+cd detectmap
+```
+
 ### Recommended: interactive installer
 
-Install **Python 3.10+** first, then run this command from the repository root:
+Run the installer from the `detectmap` folder:
 
 ```bash
 python3 setup.py
 ```
+
+On Windows, use `py -3 setup.py` if your Python installation provides the `py`
+launcher instead of `python3`.
 
 The wizard checks dependencies before changing application configuration. It
 shows each proposed installation/start command and asks before running it.
@@ -182,9 +166,95 @@ python -c "import secrets; print(secrets.token_urlsafe(32))"                    
 
 ### Where things land
 
+After setup, open the dashboard URL printed by the installer.
+
 - Frontend: `http://<host>:<port>` (or `https://` when TLS is on, default `8443`).
 - Backend: same host on port `8000` for direct HTTP, or behind Caddy when TLS is on.
 - Swagger: `<backend>/docs`.
+
+---
+
+## Screenshots
+
+These screens use fictional sample workspaces.
+
+![Detect Map dashboard overview](docs/screenshots/dashboard.png)
+
+<details>
+<summary>Sign-in, coverage, detections, and analysis</summary>
+
+**Sign-in**
+
+![Detect Map sign-in page](docs/screenshots/login.png)
+
+**Coverage matrix**
+
+![ATT&CK coverage matrix](docs/screenshots/coverage-matrix.png)
+
+**Technique drawer**
+
+![Technique drawer with linked detections](docs/screenshots/technique-drawer.png)
+
+![The same technique drawer scrolled to mitigations, D3FEND defenses, and the analyst note](docs/screenshots/technique-defenses.png)
+
+**Detection library and rule drawer**
+
+![Detection rule drawer with effectiveness, test samples, and AI authoring](docs/screenshots/detection-drawer.png)
+
+**APT coverage**
+
+![Coverage for a selected ATT&CK threat group](docs/screenshots/apt-coverage.png)
+
+**Gap analysis**
+
+![Ranked coverage gaps for a sample environment](docs/screenshots/gap-analysis.png)
+
+**GRC crosswalk**
+
+![GRC crosswalk with the selected control and its technique mappings](docs/screenshots/grc-control.png)
+
+**Reports and exports**
+
+![Available reporting and export formats](docs/screenshots/reports.png)
+
+</details>
+
+<details>
+<summary>Customer profile, detection links, and portal</summary>
+
+**Customer profile**
+
+![Sample customer profile with asset inventory, diagrams, and contacts](docs/screenshots/customer-profile.png)
+
+**Detection linker**
+
+![Detection search and selection for a customer asset](docs/screenshots/detection-linker.png)
+
+**Customer portal**
+
+![Customer portal with posture and coverage for the assigned environment](docs/screenshots/portal-overview.png)
+
+**Organization profile in the portal**
+
+![Organization profile viewed from the customer portal](docs/screenshots/portal-organization.png)
+
+</details>
+
+<details>
+<summary>AI authoring and scheduled refresh settings</summary>
+
+**AI authoring**
+
+![Settings for AI-assisted Sigma authoring](docs/screenshots/settings-ai.png)
+
+**Scheduled refresh**
+
+![Catalog and rule refresh schedule settings](docs/screenshots/settings-schedule.png)
+
+This panel uses the product administrator API. A standard dashboard sign-in
+does not grant schedule access.
+
+</details>
 
 ---
 
@@ -345,6 +415,24 @@ tests, no DB). Customer-profile tests cover assets CRUD + linkage + RBAC
 + file-on-disk cleanup (12 tests).
 
 ---
+
+## Discover assets from a capture
+
+1. Open a workspace's **Collection register** or its customer **Profile** and select **Discover assets**.
+2. Choose an uncompressed `.pcap` or `.pcapng` file up to 128 MiB and select **Preview endpoints**.
+3. Review the IPs and their observed traffic. Select the endpoints that belong in your inventory, edit the name or type as needed, and choose **Import selected**. New assets are marked **Planned**; existing IPs are skipped.
+
+![Asset discovery preview with a selected controller and a known HMI marked as already in inventory](docs/screenshots/asset-discovery.png)
+
+A capture may show remote peers, shared addresses, or a gateway's MAC address.
+Review the candidates before treating them as assets. Detect Map scans up to
+1,000,000 packets and shows up to 500 distinct IPs, with a warning if it
+reaches a limit. The capture is discarded after preview; only selected
+asset records are added.
+
+**Planned discovery methods:** start a live capture on the current machine to
+observe assets, or sweep the network to discover them actively. Both appear
+as disabled options in **Discover assets**.
 
 ## CMF classroom and student portal
 
