@@ -9,6 +9,7 @@ import {
   Box,
   Breadcrumbs,
   Button,
+  Chip,
   CircularProgress,
   Dialog,
   DialogActions,
@@ -64,6 +65,7 @@ import {
   setActiveCustomer,
 } from '@/lib/auth';
 import { FeaturesProvider } from '@/lib/features';
+import { DeploymentContext } from '@/lib/deployment';
 import {
   PreferencesProvider,
   clearPreferencesCache,
@@ -72,9 +74,11 @@ import {
 import {
   AttackNotification,
   CustomerOut,
+  DeploymentSettings,
   MeResponse,
   clearApiCache,
   fetchMe,
+  getDeploymentSettings,
   listAttackNotifications,
   listCustomers,
 } from '@/lib/api';
@@ -85,6 +89,8 @@ import { AttackNotificationsMenu } from './AttackNotificationsMenu';
 
 const DRAWER_WIDTH = 248;
 const DRAWER_WIDTH_COLLAPSED = 64;
+const PORTFOLIO_PATH = '/dashboard/portfolio';
+const CUSTOMERS_PATH = '/dashboard/customers';
 
 type NavItem = { label: string; href: string; icon: React.ReactNode };
 type NavGroup = { heading: string; items: NavItem[] };
@@ -134,6 +140,7 @@ export default function AuthedLayout({ children }: { children: React.ReactNode }
   const { mode, toggle: toggleColorMode } = useColorMode();
 
   const [me, setMe] = useState<MeResponse | null>(null);
+  const [deployment, setDeployment] = useState<DeploymentSettings | null>(null);
   const [customers, setCustomers] = useState<CustomerOut[]>([]);
   const [activeCodename, setActive] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -143,13 +150,15 @@ export default function AuthedLayout({ children }: { children: React.ReactNode }
   const [notifs, setNotifs] = useState<AttackNotification[]>([]);
   const [notifAnchor, setNotifAnchor] = useState<HTMLElement | null>(null);
   const [prefsOpen, setPrefsOpen] = useState(false);
+  const singleEnvironment = deployment?.mode === 'single';
+  const portfolioUnavailable = singleEnvironment &&
+    (pathname === PORTFOLIO_PATH || pathname.startsWith(PORTFOLIO_PATH + '/'));
 
   useEffect(() => {
     if (!getToken()) {
       router.replace('/login');
       return;
     }
-    setActive(getActiveCustomer());
     (async () => {
       try {
         const meRes = await fetchMe();
@@ -171,8 +180,25 @@ export default function AuthedLayout({ children }: { children: React.ReactNode }
         setMe(meRes);
         const isMssp = meRes.role.startsWith('mssp_');
         if (isMssp) {
-          const list = await listCustomers();
-          setCustomers(list);
+          // Legacy servers lack deployment settings. Their dashboard keeps
+          // the existing customer switcher and portfolio behavior.
+          const settings = await getDeploymentSettings().catch(() => null);
+          setDeployment(settings);
+          if (settings?.mode === 'single') {
+            setActive(settings.active_customer);
+            setActiveCustomer(settings.active_customer);
+          } else {
+            // A stored selection can disappear when sample data is hidden.
+            const list = await listCustomers().catch(() => null);
+            const stored = getActiveCustomer();
+            if (list) {
+              setCustomers(list);
+              if (stored && !list.some((c) => c.codename === stored)) {
+                setActiveCustomer(null);
+              }
+            }
+            setActive(getActiveCustomer());
+          }
         } else if (meRes.customer_codename) {
           setActive(meRes.customer_codename);
           setActiveCustomer(meRes.customer_codename);
@@ -185,6 +211,10 @@ export default function AuthedLayout({ children }: { children: React.ReactNode }
       }
     })();
   }, [router]);
+
+  useEffect(() => {
+    if (portfolioUnavailable) router.replace('/dashboard');
+  }, [portfolioUnavailable, router]);
 
   useEffect(() => {
     const handler = (e: Event) => {
@@ -243,8 +273,12 @@ export default function AuthedLayout({ children }: { children: React.ReactNode }
     );
   }
 
-  const isMssp = me?.role.startsWith('mssp_') ?? false;
+  if (!me) return null;
+
+  const isMssp = me.role.startsWith('mssp_');
+  const activeEnvironment = deployment?.environments.find((c) => c.codename === activeCodename);
   const activeCustomerName =
+    activeEnvironment?.name ??
     customers.find((c) => c.codename === activeCodename)?.name ??
     me?.customer_name ??
     null;
@@ -258,7 +292,7 @@ export default function AuthedLayout({ children }: { children: React.ReactNode }
     <PreferencesProvider>
       <ColorModePrefsBridge />
       <Box sx={{ display: 'flex', minHeight: '100vh', bgcolor: 'background.default' }}>
-        <SidebarNav pathname={pathname} />
+        <SidebarNav pathname={pathname} singleEnvironment={singleEnvironment} />
 
       <Box sx={{ flex: 1, display: 'flex', flexDirection: 'column', minWidth: 0 }}>
         <AppBar position="sticky" elevation={0}>
@@ -270,12 +304,19 @@ export default function AuthedLayout({ children }: { children: React.ReactNode }
                   color={i === arr.length - 1 ? 'text.primary' : 'text.secondary'}
                   sx={{ fontWeight: i === arr.length - 1 ? 600 : 400 }}
                 >
-                  {c}
+                  {singleEnvironment && c === 'customers' ? 'environment' : c}
                 </Typography>
               ))}
             </Breadcrumbs>
 
-            {isMssp && (
+            {singleEnvironment && activeEnvironment && (
+              <Typography variant="body2" color="text.secondary" noWrap>
+                {activeEnvironment.name}
+              </Typography>
+            )}
+            {activeEnvironment?.is_sample && <Chip label="Sample data" size="small" color="info" variant="outlined" />}
+
+            {isMssp && !singleEnvironment && (
               <>
                 <Tooltip title="Switch active customer">
                   <Button
@@ -321,7 +362,9 @@ export default function AuthedLayout({ children }: { children: React.ReactNode }
                           {c.name}
                         </Typography>
                         <Typography variant="caption" color="text.secondary">
-                          {c.codename} · {c.sector ?? 'no sector'}
+                          {deployment?.environments.some((item) => item.codename === c.codename && item.is_sample)
+                            ? 'Sample data'
+                            : `${c.codename} · ${c.sector ?? 'no sector'}`}
                         </Typography>
                       </Stack>
                     </MenuItem>
@@ -435,13 +478,16 @@ export default function AuthedLayout({ children }: { children: React.ReactNode }
           key={activeCodename ?? '__no_customer__'}
           sx={{ flex: 1, p: { xs: 2, md: 4 } }}
         >
-          <FeaturesProvider>{children}</FeaturesProvider>
+          <DeploymentContext.Provider value={deployment}>
+            <FeaturesProvider>{portfolioUnavailable ? null : children}</FeaturesProvider>
+          </DeploymentContext.Provider>
         </Box>
       </Box>
 
       <SearchPalette
         open={searchOpen}
         onClose={() => setSearchOpen(false)}
+        singleEnvironment={singleEnvironment}
       />
       <AttackNotificationsMenu
         anchorEl={notifAnchor}
@@ -557,7 +603,7 @@ function PreferencesDialog({
   );
 }
 
-function SidebarNav({ pathname }: { pathname: string }) {
+function SidebarNav({ pathname, singleEnvironment }: { pathname: string; singleEnvironment: boolean }) {
   const { get, set } = useUserPrefs();
   const collapsed = !!get<boolean>('sidebar_collapsed', false);
   const width = collapsed ? DRAWER_WIDTH_COLLAPSED : DRAWER_WIDTH;
@@ -626,12 +672,14 @@ function SidebarNav({ pathname }: { pathname: string }) {
                     pl: 3,
                   }}
                 >
-                  {group.heading}
+                  {singleEnvironment && group.heading === 'MSSP' ? 'Administration' : group.heading}
                 </ListSubheader>
               )
             }
           >
             {group.items.map((item) => {
+              if (singleEnvironment && item.href.startsWith(PORTFOLIO_PATH)) return null;
+              const label = singleEnvironment && item.href === CUSTOMERS_PATH ? 'Environment' : item.label;
               const selected =
                 item.href === '/dashboard'
                   ? pathname === '/dashboard'
@@ -656,14 +704,14 @@ function SidebarNav({ pathname }: { pathname: string }) {
                   </ListItemIcon>
                   {!collapsed && (
                     <ListItemText
-                      primary={item.label}
+                      primary={label}
                       primaryTypographyProps={{ fontSize: '0.875rem', fontWeight: 500 }}
                     />
                   )}
                 </ListItemButton>
               );
               return collapsed ? (
-                <Tooltip key={item.href} title={item.label} placement="right">
+                <Tooltip key={item.href} title={label} placement="right">
                   {button}
                 </Tooltip>
               ) : (

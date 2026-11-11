@@ -28,13 +28,13 @@ db_url = os.getenv("DATABASE_URL_SYNC") or config.get_main_option("sqlalchemy.ur
 if db_url:
     config.set_main_option("sqlalchemy.url", db_url)
 
-if config.config_file_name:
+if config.config_file_name and "connection" not in config.attributes:
     fileConfig(config.config_file_name)
 
 target_metadata = customer_metadata
 
 # Target customer schema must be supplied — there is no sensible default.
-TARGET_SCHEMA = os.environ.get("DETECTMAP_TARGET_SCHEMA")
+TARGET_SCHEMA = config.attributes.get("target_schema") or os.environ.get("DETECTMAP_TARGET_SCHEMA")
 if not TARGET_SCHEMA:
     raise RuntimeError(
         "DETECTMAP_TARGET_SCHEMA must be set when running customer migrations "
@@ -58,7 +58,26 @@ def run_migrations_offline() -> None:
         context.run_migrations()
 
 
+def migrate_connection(connection) -> None:
+    context.configure(
+        connection=connection,
+        target_metadata=target_metadata,
+        include_schemas=False,
+        version_table="alembic_version_customer",
+        version_table_schema=TARGET_SCHEMA,
+    )
+    with context.begin_transaction():
+        context.run_migrations()
+
+
 def run_migrations_online() -> None:
+    connection = config.attributes.get("connection")
+    if connection is not None:
+        connection.execute(text(f'CREATE SCHEMA IF NOT EXISTS "{TARGET_SCHEMA}"'))
+        connection.execute(text(f'SET LOCAL search_path TO "{TARGET_SCHEMA}", public'))
+        migrate_connection(connection)
+        return
+
     connectable = engine_from_config(
         config.get_section(config.config_ini_section, {}),
         prefix="sqlalchemy.",
@@ -76,15 +95,7 @@ def run_migrations_online() -> None:
         # silently. The migration logs success but no tables get created.
         connection.commit()
 
-        context.configure(
-            connection=connection,
-            target_metadata=target_metadata,
-            include_schemas=False,
-            version_table="alembic_version_customer",
-            version_table_schema=TARGET_SCHEMA,
-        )
-        with context.begin_transaction():
-            context.run_migrations()
+        migrate_connection(connection)
 
 
 if context.is_offline_mode():

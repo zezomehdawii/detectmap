@@ -20,7 +20,7 @@ import asyncio
 import logging
 import uuid
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 
 from app.db.base import AsyncSessionLocal, engine
 from app.models.public import AppSettings, ScheduledJobRun
@@ -117,7 +117,7 @@ def scheduled_snapshot(self) -> dict:
     Gated by `snapshot_refresh_enabled`. All DB work on a single event loop
     after one engine.dispose() (asyncpg loop-pinning hygiene)."""
     from app.db.tenant import set_tenant
-    from app.models.public import Customer, CustomerStatus
+    from app.models.public import Customer, CustomerStatus, MSSPOrg
     from app.services.coverage import DenominatorKind, save_snapshot
 
     async def _flow() -> dict:
@@ -128,7 +128,13 @@ def scheduled_snapshot(self) -> dict:
                 return {"skipped": True, "reason": "not enabled"}
             codenames = (
                 await session.execute(
-                    select(Customer.codename).where(Customer.status == CustomerStatus.ACTIVE)
+                    select(Customer.codename)
+                    .join(MSSPOrg, MSSPOrg.id == Customer.mssp_org_id)
+                    .where(
+                        Customer.status == CustomerStatus.ACTIVE,
+                        or_(MSSPOrg.sample_data_enabled, Customer.sample_dataset.is_(None)),
+                        or_(MSSPOrg.deployment_mode != "single", MSSPOrg.single_customer == Customer.codename),
+                    )
                 )
             ).scalars().all()
 

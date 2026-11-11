@@ -21,12 +21,12 @@ from __future__ import annotations
 import asyncio
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Optional
 
-from sqlalchemy import delete, select, text
+from sqlalchemy import select, text
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.crypto import encrypt
-from app.db.base import AsyncSessionLocal, engine
+from app.db.base import AsyncSessionLocal
 from app.db.tenant import set_tenant, tenant_session
 from app.models.customer import (
     Connector,
@@ -43,6 +43,7 @@ from app.models.public import (
     GRCControl,
     GRCFramework,
     GRCTechniqueMapping,
+    SectorProfile,
 )
 from app.services.coverage import DenominatorKind, save_snapshot
 
@@ -280,230 +281,206 @@ def _encrypt_secrets(kind: str, config: dict) -> tuple[dict, dict]:
     return plain, enc
 
 
-async def _seed_connectors(codename: str) -> None:
-    set_tenant(codename)
-    try:
-        async with tenant_session() as session:
-            for spec in CONNECTORS[codename]:
-                existing = (
-                    await session.execute(
-                        select(Connector).where(
-                            Connector.kind == spec["kind"],
-                            Connector.label == spec["label"],
-                        )
-                    )
-                ).scalar_one_or_none()
-                if existing is not None:
-                    continue
-                plain, enc = _encrypt_secrets(spec["kind"], spec["config"])
-                session.add(
-                    Connector(
-                        id=uuid.uuid4(),
-                        kind=spec["kind"],
-                        label=spec["label"],
-                        description=spec.get("description"),
-                        config=plain,
-                        encrypted_config=enc,
-                        status="planned",
-                    )
+async def _seed_connectors(session: AsyncSession, dataset: str, *, offline: bool) -> None:
+    for spec in CONNECTORS[dataset]:
+        existing = (
+            await session.execute(
+                select(Connector).where(
+                    Connector.kind == spec["kind"],
+                    Connector.label == spec["label"],
                 )
-        print(f"  {codename}: connectors ensured ({len(CONNECTORS[codename])})")
-    finally:
-        set_tenant(None)
-
-
-async def _seed_custom_detections(codename: str) -> None:
-    set_tenant(codename)
-    try:
-        async with tenant_session() as session:
-            for spec in CUSTOM_DETECTIONS[codename]:
-                existing = (
-                    await session.execute(
-                        select(Detection).where(Detection.sigma_id == spec["sigma_id"])
-                    )
-                ).scalar_one_or_none()
-                if existing is not None:
-                    continue
-                det_id = uuid.uuid4()
-                primary_tech = spec["techniques"][0]
-                session.add(
-                    Detection(
-                        id=det_id,
-                        sigma_id=spec["sigma_id"],
-                        title=spec["title"],
-                        description=f"Customer-authored detection covering {spec['techniques']}",
-                        sigma_status="experimental",
-                        level=spec["level"],
-                        author="detectmap demo seed",
-                        sigma_references=[],
-                        tags=[f"attack.{t.lower().replace('.', '_')}" for t in spec["techniques"]],
-                        logsource={"category": "process_creation", "product": "windows"},
-                        detection={"selection": {"_": "_"}, "condition": "selection"},
-                        falsepositives=["Legitimate automation"],
-                        raw_yaml=_custom_yaml(spec["sigma_id"], spec["title"], primary_tech),
-                        detection_status=spec["status"],
-                        source=DetectionSource.CUSTOM,
-                        score_breadth=2,
-                        score_depth=spec["depth"],
-                        review_status=(
-                            DetectionReviewStatus.APPROVED.value
-                            if spec["status"] == DetectionStatus.DEPLOYED
-                            else DetectionReviewStatus.DRAFT.value
-                        ),
-                        reviewed_at=(
-                            datetime.now(timezone.utc)
-                            if spec["status"] == DetectionStatus.DEPLOYED
-                            else None
-                        ),
-                    )
-                )
-                for t in spec["techniques"]:
-                    session.add(
-                        DetectionTechnique(
-                            id=uuid.uuid4(),
-                            detection_id=det_id,
-                            technique_id=t,
-                            domain="ics" if t.startswith("T0") else "enterprise",
-                        )
-                    )
-        print(
-            f"  {codename}: custom detections ensured "
-            f"({len(CUSTOM_DETECTIONS[codename])})"
+            )
+        ).scalar_one_or_none()
+        if existing is not None:
+            continue
+        plain, enc = _encrypt_secrets(spec["kind"], spec["config"])
+        if offline and "host" in plain:
+            plain["host"] = "https://sample.example.invalid" if spec["kind"] == "elastic" else "sample.example.invalid"
+        session.add(
+            Connector(
+                id=uuid.uuid4(),
+                kind=spec["kind"],
+                label=spec["label"],
+                description=spec.get("description"),
+                config=plain,
+                encrypted_config=enc,
+                status="planned",
+            )
         )
-    finally:
-        set_tenant(None)
 
 
-async def _seed_customized_forks(codename: str) -> None:
-    set_tenant(codename)
-    try:
-        async with tenant_session() as session:
-            for fork in CUSTOMIZED_FORKS[codename]:
-                # Skip if we've already created the fork (look for the suffix
-                # in any existing customized row).
-                suffix = fork["new_title_suffix"]
-                already = (
-                    await session.execute(
-                        select(Detection).where(
-                            Detection.source == DetectionSource.CUSTOMIZED,
-                            Detection.title.ilike(f"%{suffix}%"),
-                        )
-                    )
-                ).scalar_one_or_none()
-                if already is not None:
-                    continue
-
-                upstream = (
-                    await session.execute(
-                        select(Detection)
-                        .where(
-                            Detection.source == DetectionSource.GLOBAL,
-                            Detection.title.ilike(fork["match_title_ilike"]),
-                        )
-                        .limit(1)
-                    )
-                ).scalar_one_or_none()
-                if upstream is None:
-                    print(
-                        f"  {codename}: no upstream match for {fork['match_title_ilike']!r}; skipping fork"
-                    )
-                    continue
-
-                clone_id = uuid.uuid4()
-                session.add(
-                    Detection(
-                        id=clone_id,
-                        sigma_id=f"{upstream.sigma_id}.customized",
-                        title=f"{upstream.title}{suffix}",
-                        description=upstream.description,
-                        sigma_status=upstream.sigma_status,
-                        level=upstream.level,
-                        author="detectmap demo seed (forked)",
-                        sigma_references=list(upstream.sigma_references or []),
-                        tags=list(upstream.tags or []),
-                        logsource=dict(upstream.logsource or {}),
-                        detection=dict(upstream.detection or {}),
-                        falsepositives=list(upstream.falsepositives or []),
-                        raw_yaml=upstream.raw_yaml,
-                        detection_status=fork["status"],
-                        source=DetectionSource.CUSTOMIZED,
-                        score_breadth=upstream.score_breadth,
-                        score_depth=fork["depth"],
-                        upstream_global_id=upstream.sigma_id,
-                        review_status=(
-                            DetectionReviewStatus.APPROVED.value
-                            if fork["status"] == DetectionStatus.DEPLOYED
-                            else DetectionReviewStatus.DRAFT.value
-                        ),
-                        reviewed_at=(
-                            datetime.now(timezone.utc)
-                            if fork["status"] == DetectionStatus.DEPLOYED
-                            else None
-                        ),
-                    )
+async def _seed_custom_detections(session: AsyncSession, dataset: str) -> None:
+    for spec in CUSTOM_DETECTIONS[dataset]:
+        existing = (
+            await session.execute(
+                select(Detection).where(Detection.sigma_id == spec["sigma_id"])
+            )
+        ).scalar_one_or_none()
+        if existing is not None:
+            continue
+        det_id = uuid.uuid4()
+        primary_tech = spec["techniques"][0]
+        session.add(
+            Detection(
+                id=det_id,
+                sigma_id=spec["sigma_id"],
+                title=spec["title"],
+                description=f"Customer-authored detection covering {spec['techniques']}",
+                sigma_status="experimental",
+                level=spec["level"],
+                author="detectmap demo seed",
+                sigma_references=[],
+                tags=[f"attack.{t.lower().replace('.', '_')}" for t in spec["techniques"]],
+                logsource={"category": "process_creation", "product": "windows"},
+                detection={"selection": {"_": "_"}, "condition": "selection"},
+                falsepositives=["Legitimate automation"],
+                raw_yaml=_custom_yaml(spec["sigma_id"], spec["title"], primary_tech),
+                detection_status=spec["status"],
+                source=DetectionSource.CUSTOM,
+                score_breadth=2,
+                score_depth=spec["depth"],
+                review_status=(
+                    DetectionReviewStatus.APPROVED.value
+                    if spec["status"] == DetectionStatus.DEPLOYED
+                    else DetectionReviewStatus.DRAFT.value
+                ),
+                reviewed_at=(
+                    datetime.now(timezone.utc)
+                    if spec["status"] == DetectionStatus.DEPLOYED
+                    else None
+                ),
+            )
+        )
+        for t in spec["techniques"]:
+            session.add(
+                DetectionTechnique(
+                    id=uuid.uuid4(),
+                    detection_id=det_id,
+                    technique_id=t,
+                    domain="ics" if t.startswith("T0") else "enterprise",
                 )
-                # Copy upstream's technique mappings onto the fork.
-                techs = (
-                    await session.execute(
-                        select(DetectionTechnique).where(
-                            DetectionTechnique.detection_id == upstream.id
-                        )
-                    )
-                ).scalars().all()
-                for t in techs:
-                    session.add(
-                        DetectionTechnique(
-                            id=uuid.uuid4(),
-                            detection_id=clone_id,
-                            technique_id=t.technique_id,
-                            domain=t.domain,
-                        )
-                    )
-                print(
-                    f"  {codename}: customized fork of '{upstream.title}' "
-                    f"({len(techs)} techniques)"
+            )
+
+
+async def _seed_customized_forks(session: AsyncSession, dataset: str, codename: str) -> None:
+    for fork in CUSTOMIZED_FORKS[dataset]:
+        # Skip if we've already created the fork (look for the suffix
+        # in any existing customized row).
+        suffix = fork["new_title_suffix"]
+        already = (
+            await session.execute(
+                select(Detection).where(
+                    Detection.source == DetectionSource.CUSTOMIZED,
+                    Detection.title.ilike(f"%{suffix}%"),
                 )
-    finally:
-        set_tenant(None)
+            )
+        ).scalar_one_or_none()
+        if already is not None:
+            continue
+
+        upstream = (
+            await session.execute(
+                select(Detection)
+                .where(
+                    Detection.source == DetectionSource.GLOBAL,
+                    Detection.title.ilike(fork["match_title_ilike"]),
+                )
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        if upstream is None:
+            print(
+                f"  {codename}: no upstream match for {fork['match_title_ilike']!r}; skipping fork"
+            )
+            continue
+
+        clone_id = uuid.uuid4()
+        session.add(
+            Detection(
+                id=clone_id,
+                sigma_id=f"{upstream.sigma_id}.customized",
+                title=f"{upstream.title}{suffix}",
+                description=upstream.description,
+                sigma_status=upstream.sigma_status,
+                level=upstream.level,
+                author="detectmap demo seed (forked)",
+                sigma_references=list(upstream.sigma_references or []),
+                tags=list(upstream.tags or []),
+                logsource=dict(upstream.logsource or {}),
+                detection=dict(upstream.detection or {}),
+                falsepositives=list(upstream.falsepositives or []),
+                raw_yaml=upstream.raw_yaml,
+                detection_status=fork["status"],
+                source=DetectionSource.CUSTOMIZED,
+                score_breadth=upstream.score_breadth,
+                score_depth=fork["depth"],
+                upstream_global_id=upstream.sigma_id,
+                review_status=(
+                    DetectionReviewStatus.APPROVED.value
+                    if fork["status"] == DetectionStatus.DEPLOYED
+                    else DetectionReviewStatus.DRAFT.value
+                ),
+                reviewed_at=(
+                    datetime.now(timezone.utc)
+                    if fork["status"] == DetectionStatus.DEPLOYED
+                    else None
+                ),
+            )
+        )
+        # Copy upstream's technique mappings onto the fork.
+        techs = (
+            await session.execute(
+                select(DetectionTechnique).where(
+                    DetectionTechnique.detection_id == upstream.id
+                )
+            )
+        ).scalars().all()
+        for t in techs:
+            session.add(
+                DetectionTechnique(
+                    id=uuid.uuid4(),
+                    detection_id=clone_id,
+                    technique_id=t.technique_id,
+                    domain=t.domain,
+                )
+            )
+        print(
+            f"  {codename}: customized fork of '{upstream.title}' "
+            f"({len(techs)} techniques)"
+        )
 
 
-async def _add_status_variety(codename: str) -> None:
+async def _add_status_variety(session: AsyncSession, dataset: str) -> None:
     """Promote a sample of `idea` rows to `gap` and `not_applicable`.
 
     Idempotent in the sense that re-running tops up to the configured counts
     (it'll only flip more rows if the current `gap`/`not_applicable` counts
     are below the target).
     """
-    targets = STATUS_VARIETY[codename]
-    set_tenant(codename)
-    try:
-        async with tenant_session() as session:
-            for status, target in targets.items():
-                current = (
-                    await session.execute(
-                        select(text("count(*)")).where(text(
-                            f"detection_status = '{status}'"
-                        )).select_from(Detection)
-                    )
-                ).scalar() or 0
-                need = max(0, target - current)
-                if need == 0:
-                    continue
-                # Promote `need` random `idea` rows to the target status.
-                await session.execute(
-                    text(
-                        "UPDATE detections SET detection_status = :s "
-                        "WHERE id IN ("
-                        "  SELECT id FROM detections "
-                        "  WHERE detection_status = 'idea' AND source = 'global' "
-                        "  ORDER BY random() LIMIT :n"
-                        ")"
-                    ),
-                    {"s": status, "n": need},
-                )
-        print(f"  {codename}: status variety topped up to {targets}")
-    finally:
-        set_tenant(None)
+    targets = STATUS_VARIETY[dataset]
+    for status, target in targets.items():
+        current = (
+            await session.execute(
+                select(text("count(*)")).where(text(
+                    f"detection_status = '{status}'"
+                )).select_from(Detection)
+            )
+        ).scalar() or 0
+        need = max(0, target - current)
+        if need == 0:
+            continue
+        # Promote `need` random `idea` rows to the target status.
+        await session.execute(
+            text(
+                "UPDATE detections SET detection_status = :s "
+                "WHERE id IN ("
+                "  SELECT id FROM detections "
+                "  WHERE detection_status = 'idea' AND source = 'global' "
+                "  ORDER BY random() LIMIT :n"
+                ")"
+            ),
+            {"s": status, "n": need},
+        )
 
 
 async def _seed_user_grc_mappings(actor_email: str) -> None:
@@ -552,62 +529,38 @@ async def _seed_user_grc_mappings(actor_email: str) -> None:
     print(f"user GRC mappings ensured ({len(USER_GRC_MAPPINGS)} candidates)")
 
 
-async def _seed_sector_snapshot(codename: str, sector_ref: str) -> None:
-    set_tenant(codename)
-    try:
-        snap = await save_snapshot(
-            "enterprise",
-            DenominatorKind.SECTOR,
-            sector_ref,
-            notes="dummy seed: sector denominator",
-        )
-        print(
-            f"  {codename}: sector snapshot ({sector_ref}) "
-            f"posture={snap.posture_grade} breadth={snap.breadth_score}"
-        )
-    finally:
-        set_tenant(None)
+async def seed_tenant_fixtures(
+    session: AsyncSession, dataset: str, codename: str, *, offline: bool = False,
+) -> None:
+    """Load a sample dataset into a caller-owned tenant transaction."""
+    await _seed_connectors(session, dataset, offline=offline)
+    await _seed_custom_detections(session, dataset)
+    await session.flush()
+    await _seed_customized_forks(session, dataset, codename)
+    await session.flush()
+    await _add_status_variety(session, dataset)
+    sector = {"acme": "finance", "globex": "energy"}[dataset]
+    profile = await session.scalar(select(SectorProfile.id).where(SectorProfile.sector == sector))
+    snapshot_note = "dummy seed: sector denominator"
+    snapshot = await session.scalar(select(CoverageSnapshot.id).where(CoverageSnapshot.notes == snapshot_note).limit(1))
+    if profile is not None and snapshot is None:
+        await save_snapshot("enterprise", DenominatorKind.SECTOR, sector, notes=snapshot_note, session=session)
 
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
 
 async def run() -> None:
-    print("== resolving customers ==")
-    cust = await _customer_ids()
-    print(f"found: {', '.join(f'{k}={v}' for k, v in cust.items())}")
-
-    print("\n== branding ==")
+    customers = await _customer_ids()
+    print(f"found: {', '.join(f'{k}={v}' for k, v in customers.items())}")
     await _set_branding()
-
-    print("\n== connectors ==")
-    for codename in cust:
-        await _seed_connectors(codename)
-
-    print("\n== custom detections ==")
-    for codename in cust:
-        await _seed_custom_detections(codename)
-
-    print("\n== customized forks ==")
-    for codename in cust:
-        await _seed_customized_forks(codename)
-
-    print("\n== status variety ==")
-    for codename in cust:
-        await _add_status_variety(codename)
-
-    print("\n== user GRC mappings ==")
-    await _seed_user_grc_mappings("admin@demo.local")
-
-    print("\n== sector-denominator snapshots ==")
-    sector_for = {"acme": "finance", "globex": "energy"}
-    for codename, sector_ref in sector_for.items():
+    for codename in customers:
+        set_tenant(codename)
         try:
-            await _seed_sector_snapshot(codename, sector_ref)
-        except Exception as exc:  # snapshot is best-effort: never fail the seed
-            print(f"  {codename}: sector snapshot failed: {exc}")
+            async with tenant_session() as session:
+                await seed_tenant_fixtures(session, codename, codename)
+            print(f"  {codename}: tenant fixtures ensured")
+        finally:
+            set_tenant(None)
 
+    await _seed_user_grc_mappings("admin@demo.local")
     print("\nseed complete.")
 
 

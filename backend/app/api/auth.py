@@ -25,6 +25,7 @@ from app.core.security import (
 from app.db.base import AsyncSessionLocal
 from app.models.public import AppSettings, Customer, MSSPOrg, Role, SuperAdmin, User
 from app.services import customer_features
+from app.services.deployment import load_scope
 
 log = logging.getLogger(__name__)
 
@@ -200,9 +201,10 @@ async def login(req: LoginRequest) -> TokenResponse:
                     select(Customer).where(Customer.id == user.customer_id)
                 )
             ).scalar_one_or_none()
-            if customer is not None and not customer_features.is_enabled(
-                customer.features, "customer_portal"
-            ):
+            scope = await load_scope(session, user.mssp_org_id)
+            if customer is None or customer.mssp_org_id != user.mssp_org_id or not scope.permits(customer):
+                raise HTTPException(403, "This environment is unavailable in the current deployment mode.")
+            if not customer_features.is_enabled(customer.features, "customer_portal"):
                 raise HTTPException(
                     403,
                     "Customer portal access is disabled for this tenant. "

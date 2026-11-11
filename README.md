@@ -1,12 +1,12 @@
 # detectmap
 
-**The Detection Map** — a multi-tenant MSSP platform for MITRE ATT&CK–driven
-detection coverage, gap analysis, and threat-informed defense.
+**The Detection Map** — a platform for MITRE ATT&CK–driven detection coverage,
+gap analysis, and threat-informed defense.
 
-One MSSP runs detectmap as a single instance. Inside it, the MSSP's analysts
-review every customer's detection posture: which ATT&CK techniques are
-covered, by which Sigma rules, at what depth, against which APT groups,
-with what gaps. Outputs include MITRE Navigator–style coverage matrices,
+Run Detect Map for a single organization or site, or switch to multi-tenant
+mode to manage multiple isolated environments. Analysts can see which Sigma
+rules cover each ATT&CK technique and where gaps remain for a given APT group.
+Outputs include MITRE Navigator–style coverage matrices,
 branded executive PDFs, Sigma rule packs converted to Splunk SPL / Elastic
 Lucene / Sentinel KQL, and GRC crosswalks against NIST CSF, ISO 27001, and
 the Saudi NCA controls.
@@ -105,9 +105,12 @@ The configuration prompts provide suggested values; press **Enter** to accept:
 2. **Transport:** HTTP, HTTPS with a generated certificate, or HTTPS with your certificate.
 3. **Listen port:** HTTP defaults to **8080**, HTTPS to **8443**. The chosen port drives the actual frontend/proxy mapping.
 4. **Administrator identities:** `admin@demo.local` for the dashboard and `super@detectmap.local` for product administration. A custom dashboard email is also written to the sign-in hint configuration.
+5. **Single environment** is the default and opens one workspace automatically. Choose **Multi-tenant** for separate customer, site, or classroom workspaces.
+6. **Start fresh** is the default and skips the sample records. Choose **Add sample data** to explore the Acme and Globex examples. A single-environment setup with samples opens a sample workspace first.
 
-Setup builds and starts the stack, waits for the API, and initializes the two
-administrators **only when the deployment is empty**. The dashboard administrator
+Setup builds and starts the stack and waits for the API. It asks for the
+deployment mode and initial data only after confirming the database is empty.
+It then initializes the two administrators and applies those choices. The dashboard administrator
 uses the credentials displayed on the login page: **`admin@demo.local` / `change-me`**
 by default. Under **Settings → Branding**, turn off **Show default credentials on
 the sign-in page** to hide the card; the administrator account remains active.
@@ -120,6 +123,17 @@ password, printed once after commit, and must change it on first login.
 Existing deployments, accounts, visibility settings, and customer data remain
 unchanged on normal reruns.
 
+Dashboard administrators can revisit both choices under **Settings → Deployment**.
+In single-environment mode, choose the workspace to use. Other workspaces and
+their records remain stored. Users assigned to those workspaces regain access
+when you switch back to multi-tenant mode.
+Turning sample data off hides only the sample workspaces managed by this setting.
+Turning it back on restores those workspaces with their records intact.
+If a sample workspace was active in single-environment mode, the app switches to
+a regular workspace or creates an empty one. The setting does not change
+shared reference catalogs, existing user-created workspaces, or workspaces
+created by the older manual demo scripts.
+
 An existing `.env` is kept by default. Choosing to reconfigure updates only
 network settings, retaining database credentials, encryption keys, and other
 operator settings. `--keep-env` skips that choice. `--skip-reset` remains a
@@ -131,7 +145,8 @@ python3 setup.py --keep-env --skip-reset
 
 A factory reset is available only with `--reset`, and setup asks for confirmation
 before dependency installation or deployment changes. It restores the configured
-dashboard default login and its credential card. Do not use it for an upgrade.
+dashboard default login and its credential card, and asks again for mode and
+sample data. Do not use it for an upgrade.
 
 Dependency instructions are based on [Docker's Ubuntu](https://docs.docker.com/engine/install/ubuntu/),
 [Debian](https://docs.docker.com/engine/install/debian/), and
@@ -338,7 +353,8 @@ dedicated student accounts, synthetic ICS starter data, source validation,
 JSON/CSV submissions, and scoped starter restoration.
 
 MSSP users work at `/dashboard/cmf`. Students sign in using a `customer_user`
-account assigned to one customer and open `/portal/cmf`. Create these users
+account assigned to one customer and open `/portal/cmf`. Use **Multi-tenant**
+mode to run separate student workspaces. Create these users
 under **Customers → select customer → Users**. Each student/team should have
 its own customer so its collection inventory and plan remain separate.
 
@@ -362,7 +378,7 @@ docker compose exec backend pytest --confcutdir=tests/cmf_unit tests/cmf_unit -q
 detectmap/
 ├── docker-compose.yml          # db · redis · backend · worker · beat · frontend
 ├── docker-compose.tls.yml      # optional Caddy overlay
-├── setup.py                    # interactive installer (TLS, port, factory-reset)
+├── setup.py                    # interactive installer (network, mode, sample data, factory reset)
 ├── .env.example
 ├── CLAUDE.md                   # design contract + roadmap
 ├── backend/
@@ -429,10 +445,10 @@ detectmap/
 
 - **Two JWT secrets.** `JWT_TENANT_SECRET` and `JWT_SUPERADMIN_SECRET` are different. The `aud` claim routes the token to the correct verifier. Tests in `tests/test_security.py::TestJWTAudienceSeparation` lock this contract in.
 - **Codename validation.** `schema_for(codename)` validates against `^[a-z][a-z0-9_]{1,30}$` before any SQL interpolation; tenant SQL never receives an unvalidated identifier.
-- **Tenancy single entrypoint.** Never `.execute(text("SET search_path …"))` outside `tenant_session()`. Customer-scoped models have no schema qualifier so cross-tenant access is structurally impossible without a tenant set.
+- **Tenant context.** Customer-scoped request data uses `tenant_session()` with a transaction-local search path. First-run workspace provisioning pins the new schema within its own transaction while it applies migrations and inserts records.
 - **Customer users hard-pinned.** A `customer_user`'s JWT carries their `customer_id`; the `X-Customer` header is rejected if it disagrees. No way to reach another tenant from a customer login.
 - **Secrets at rest.** Connector credentials, AI API keys, LDAP/SMTP credentials are Fernet-encrypted via `app/core/crypto.py`. Key rotation requires re-encryption under the new key — don't rotate without it.
-- **Initial admin.** `setup.py` generates a random initial password, prints it once, and sets `must_change_password=True`. The login flow routes through `/change-password` until the user rotates it.
+- **Initial admin.** `setup.py` initializes the dashboard admin from the configured login defaults. The separate product super admin receives a generated temporary password and must change it at first sign-in.
 - **Diagram uploads.** Mime allow-list rejects HTML / JavaScript / executable types outright; binaries are always served with `Content-Disposition: attachment` so the browser won't execute them. Stored-path resolution checks the result stays under the storage root (path-traversal defence).
 - **Tokens.** Bearer tokens currently live in `localStorage` for development convenience — migrate to HttpOnly cookies before going to production. Noted in `frontend/lib/auth.ts`.
 

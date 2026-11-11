@@ -52,7 +52,7 @@ def isolated_project():
 
 
 @contextmanager
-def mocked_flow(arguments, *, answer=None, confirms=None):
+def mocked_flow(arguments, *, answer=None, confirms=None, choices=None, empty=True):
     """Mock every boundary that can mutate the host or the Docker deployment."""
     with ExitStack() as stack:
         stack.enter_context(mock.patch.dict(os.environ))
@@ -61,6 +61,7 @@ def mocked_flow(arguments, *, answer=None, confirms=None):
             installer, "ensure_runtime", return_value=["docker", "compose"]))
         compose = stack.enter_context(mock.patch.object(installer, "run_compose"))
         health = stack.enter_context(mock.patch.object(installer, "wait_for_backend"))
+        status = stack.enter_context(mock.patch.object(installer, "deployment_is_empty", return_value=empty))
         initialize = stack.enter_context(mock.patch.object(installer, "run_initialization"))
         reset = stack.enter_context(mock.patch.object(installer, "run_factory_reset"))
         stack.enter_context(mock.patch.object(installer, "detect_host_ip", return_value="198.51.100.25"))
@@ -68,13 +69,15 @@ def mocked_flow(arguments, *, answer=None, confirms=None):
             lambda question, default=None: default or "")))
         confirmation = stack.enter_context(mock.patch.object(installer, "confirm", side_effect=confirms or (
             lambda question, default=False: default)))
-        stack.enter_context(mock.patch.object(installer, "choose", return_value="none"))
+        selection = stack.enter_context(mock.patch.object(
+            installer, "choose", side_effect=lambda question, options, default=None: (choices or {}).get(question, default)))
         for method in ["run", "check_call", "check_output", "Popen"]:
             stack.enter_context(mock.patch.object(installer.subprocess, method,
                 side_effect=AssertionError("test attempted a real subprocess boundary")))
         output = stack.enter_context(redirect_stdout(io.StringIO()))
         yield {"runtime": runtime, "compose": compose, "health": health,
                "initialize": initialize, "reset": reset, "confirm": confirmation,
+               "status": status, "choose": selection,
                "output": output}
 
 
@@ -199,9 +202,24 @@ class InteractiveSetupFlowTests(unittest.TestCase):
             calls["runtime"].assert_called_once()
             calls["compose"].assert_called_once()
             calls["health"].assert_called_once()
+            calls["status"].assert_called_once_with(["docker", "compose"], False)
             calls["initialize"].assert_called_once()
             self.assertEqual(calls["initialize"].call_args.args[2], values["DEFAULT_LOGIN_EMAIL"])
+            self.assertEqual(calls["initialize"].call_args.kwargs, {"mode": "single", "sample_data": "fresh"})
+            self.assertIn("Settings -> Deployment", calls["output"].getvalue())
             calls["reset"].assert_not_called()
+
+    def test_empty_database_can_choose_multi_tenant_and_sample_data_with_saved_env(self):
+        choices = {"How will you use Detect Map?": "multi_tenant",
+                   "What data should Detect Map start with?": "sample"}
+        with isolated_project() as root:
+            original_env, original_tls = seed_saved_configuration(root)
+            with mocked_flow(["--keep-env"], choices=choices) as calls:
+                installer.main()
+                calls["initialize"].assert_called_once_with(
+                    ["docker", "compose"], False, None, "super@detectmap.local",
+                    mode="multi_tenant", sample_data="sample")
+                assert_kept_files(self, root, original_env, original_tls)
 
     def test_custom_fresh_admin_email_matches_the_configured_login_hint(self):
         def answers(question, default=None):
@@ -233,7 +251,9 @@ class InteractiveSetupFlowTests(unittest.TestCase):
                 self.assertIsNone(calls["initialize"].call_args.args[2])
 
     def test_fresh_self_signed_setup_writes_environment_before_container_certificate_step(self):
-        with isolated_project() as root, mocked_flow([]) as calls:
+        with isolated_project() as root, mocked_flow([], choices={
+            "How should the dashboard be served?": "self-signed",
+        }) as calls:
             def generate(host, compose):
                 # Compose's backend has env_file=.env even during this first
                 # certificate build, so it must already exist at this point.
@@ -247,8 +267,7 @@ class InteractiveSetupFlowTests(unittest.TestCase):
                 (root / "tls" / "cert.pem").write_text("generated certificate", encoding="utf-8")
                 (root / "tls" / "key.pem").write_text("generated key", encoding="utf-8")
 
-            with mock.patch.object(installer, "choose", return_value="self-signed"), \
-                 mock.patch.object(installer, "generate_self_signed", side_effect=generate) as certificate:
+            with mock.patch.object(installer, "generate_self_signed", side_effect=generate) as certificate:
                 installer.main()
             certificate.assert_called_once()
             self.assertTrue((root / "tls" / "Caddyfile").is_file())
@@ -260,20 +279,24 @@ class InteractiveSetupFlowTests(unittest.TestCase):
     def test_keep_env_and_skip_reset_preserve_secrets_tls_and_actual_url(self):
         with isolated_project() as root:
             original_env, original_tls = seed_saved_configuration(root)
-            with mocked_flow(["--keep-env", "--skip-reset"]) as calls:
+            with mocked_flow(["--keep-env", "--skip-reset"], empty=False) as calls:
                 installer.main()
                 assert_kept_files(self, root, original_env, original_tls)
                 self.assertIn("http://saved.example:8181", calls["output"].getvalue())
                 self.assertNotIn("http://198.51.100.25:", calls["output"].getvalue())
-                calls["initialize"].assert_called_once()
+                calls["initialize"].assert_not_called()
+                calls["choose"].assert_not_called()
                 calls["reset"].assert_not_called()
     def test_existing_environment_is_preserved_by_default_without_special_flags(self):
         with isolated_project() as root:
             original_env, original_tls = seed_saved_configuration(root)
-            with mocked_flow([]) as calls:
+            with mocked_flow([], empty=False) as calls:
                 installer.main()
                 assert_kept_files(self, root, original_env, original_tls)
                 self.assertIn("http://saved.example:8181", calls["output"].getvalue())
+                self.assertIn("Existing deployment detected", calls["output"].getvalue())
+                calls["initialize"].assert_not_called()
+                calls["choose"].assert_not_called()
                 calls["reset"].assert_not_called()
 
     def test_declined_dependency_setup_cannot_change_environment_or_start_stack(self):
@@ -309,11 +332,25 @@ class InteractiveSetupFlowTests(unittest.TestCase):
                 self.assertTrue(any(call.kwargs.get("default", False) is False
                                     for call in calls["confirm"].call_args_list))
 
+    def test_confirmed_reset_prompts_for_new_mode_and_data_without_probing_empty_database(self):
+        with isolated_project() as root:
+            original_env, original_tls = seed_saved_configuration(root)
+            with mocked_flow(["--reset", "--keep-env"], confirms=lambda *_args, **_kwargs: True,
+                             choices={"What data should Detect Map start with?": "sample"}) as calls:
+                installer.main()
+                calls["status"].assert_not_called()
+                calls["initialize"].assert_not_called()
+                calls["reset"].assert_called_once_with(
+                    ["docker", "compose"], False, None, "super@detectmap.local",
+                    mode="single", sample_data="sample")
+                assert_kept_files(self, root, original_env, original_tls)
+
     def test_reconfigure_changes_network_only_and_keeps_old_tls_material(self):
         with isolated_project() as root:
             original_env, original_tls = seed_saved_configuration(root, tls_mode="self-signed", listen_port=9443)
             before = env_values(root / ".env")
-            with mocked_flow(["--skip-reset"], confirms=lambda question, default=False: False) as calls:
+            with mocked_flow(["--skip-reset"], confirms=lambda question, default=False: False,
+                             choices={"How should the dashboard be served?": "none"}) as calls:
                 installer.main()
                 after = env_values(root / ".env")
                 for key in ["POSTGRES_PASSWORD", "JWT_TENANT_SECRET", "JWT_SUPERADMIN_SECRET",
@@ -368,12 +405,32 @@ class InteractiveSetupFlowTests(unittest.TestCase):
 class ResetConfigurationTests(unittest.TestCase):
     def test_explicit_reset_requests_configured_login_defaults_without_password_arguments(self):
         with mock.patch.object(installer, "run_compose") as compose:
-            installer.run_factory_reset(["docker", "compose"], False, "admin@demo.local", "super@detectmap.local")
+            installer.run_factory_reset(
+                ["docker", "compose"], False, "admin@demo.local", "super@detectmap.local",
+                mode="multi_tenant", sample_data="sample")
         arguments = compose.call_args.args[1]
         self.assertIn("--use-login-defaults", arguments)
         self.assertIn("--yes", arguments)
         self.assertNotIn("--admin-password", arguments)
         self.assertNotIn("--super-password", arguments)
+        self.assertEqual(arguments[-6:], [
+            "--deployment-mode", "multi_tenant", "--sample-data", "sample",
+            "--admin-email", "admin@demo.local",
+        ])
+
+
+class InitialDeploymentProbeTests(unittest.TestCase):
+    def test_status_requires_a_boolean_response(self):
+        for invalid_status in ('{"empty": "false"}', '[]', 'bad status'):
+            with self.subTest(status=invalid_status), mock.patch.object(
+                installer.subprocess, "check_output", return_value=invalid_status,
+            ), self.assertRaises(RuntimeError):
+                installer.deployment_is_empty(["docker", "compose"], False)
+
+    def test_valid_status_is_read_without_running_initialization(self):
+        with mock.patch.object(installer.subprocess, "check_output", return_value='{"empty": false}\n') as check:
+            self.assertFalse(installer.deployment_is_empty(["docker", "compose"], False))
+        self.assertEqual(check.call_args.args[0][-3:], ["-m", "app.scripts.initialize_admins", "--status-only"])
 
 
 class CertificateCopyTests(unittest.TestCase):

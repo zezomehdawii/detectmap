@@ -22,6 +22,7 @@ from app.models.public import (
     Customer,
     D3FENDTechnique,
 )
+from app.services.deployment import DeploymentScope
 
 
 @dataclass
@@ -44,6 +45,7 @@ async def global_search(
     *,
     has_tenant: bool,
     mssp_org_id: Optional[str] = None,
+    deployment: DeploymentScope = DeploymentScope(),
     limit_per_kind: int = 6,
 ) -> SearchResults:
     q = query.strip()
@@ -176,6 +178,7 @@ async def global_search(
                         select(Customer)
                         .where(
                             Customer.mssp_org_id == org_uuid,
+                            deployment.customer_filter(),
                             or_(
                                 Customer.codename.ilike(like),
                                 Customer.name.ilike(like),

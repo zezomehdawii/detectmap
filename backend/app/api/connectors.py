@@ -369,6 +369,8 @@ async def sync_use_cases(
     """Live-fetch the connector's deployed rules and upsert them."""
     from app.services import deployed_usecases as uc
 
+    if __.customer.sample_dataset is not None:
+        raise HTTPException(403, "Live connector sync is unavailable in sample workspaces.")
     async with tenant_session() as session:
         row = await _get_connector_or_404(session, connector_id)
         secrets = _decrypt_secrets(row)

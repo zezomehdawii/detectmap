@@ -18,6 +18,7 @@ import logging
 import re
 import secrets
 import sys
+from typing import Literal
 import uuid
 
 from sqlalchemy import func, select, text
@@ -26,7 +27,8 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from app.config import settings
 from app.core.security import hash_password
 from app.db.base import AsyncSessionLocal, engine
-from app.models.public import AppSettings, Customer, MSSPOrg, Role, SuperAdmin, User
+from app.models.public import AppSettings, Customer, DeploymentMode, MSSPOrg, Role, SuperAdmin, User
+from app.services.deployment import configure
 
 # Avoid emitting INSERT parameters (including password hashes) in the setup
 # terminal when the installation otherwise enables SQLAlchemy debug output.
@@ -89,6 +91,8 @@ async def initialize_admins(
     *, admin_email: str | None = None,
     super_email: str = DEFAULT_SUPER_EMAIL,
     status_only: bool = False,
+    deployment_mode: DeploymentMode = "multi_tenant",
+    sample_data: Literal["sample", "fresh"] = "fresh",
 ) -> InitializationResult:
     result = InitializationResult(empty=False)
     async with AsyncSessionLocal() as session:
@@ -131,6 +135,11 @@ async def initialize_admins(
                         set_={"show_login_hint": True},
                     )
                 )
+                if deployment_mode != "multi_tenant" or sample_data == "sample":
+                    await configure(
+                        session, org, mode=deployment_mode, sample_data_enabled=sample_data == "sample",
+                        initializing=True,
+                    )
                 result = InitializationResult(
                     empty=True, created=True,
                     admin_email=admin_email, admin_password=admin_password,
@@ -163,11 +172,15 @@ def main() -> None:
     parser.add_argument("--admin-email", default=None, help="Dashboard administrator email (default: DEFAULT_LOGIN_EMAIL)")
     parser.add_argument("--super-email", default=DEFAULT_SUPER_EMAIL)
     parser.add_argument("--status-only", action="store_true", help="Report whether initialization is possible without changing records")
+    parser.add_argument("--deployment-mode", choices=("single", "multi_tenant"), default="multi_tenant")
+    parser.add_argument("--sample-data", choices=("sample", "fresh"), default="fresh")
     args = parser.parse_args()
     try:
         result = asyncio.run(initialize_admins(
             admin_email=args.admin_email, super_email=args.super_email,
             status_only=args.status_only,
+            deployment_mode=args.deployment_mode,
+            sample_data=args.sample_data,
         ))
     except ValueError as exc:
         parser.error(str(exc))

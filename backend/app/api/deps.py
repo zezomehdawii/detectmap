@@ -31,6 +31,7 @@ from app.core.security import JWTError, TokenAudience, decode_token
 from app.db.base import AsyncSessionLocal
 from app.db.tenant import set_tenant
 from app.models.public import Customer, Role, SuperAdmin, User
+from app.services.deployment import DeploymentScope, SAMPLE_DISABLED_FEATURES, load_scope
 
 _bearer = HTTPBearer(auto_error=False)
 
@@ -47,6 +48,7 @@ class TenantPrincipal:
     """The authenticated tenant user + active customer (if any)."""
     user: User
     customer: Optional[Customer]  # None for MSSP users with no X-Customer set
+    deployment: DeploymentScope = DeploymentScope()
 
 
 # ---- low-level helpers ----------------------------------------------------
@@ -133,6 +135,7 @@ async def current_tenant_user(
             raise _credentials_exception("User not found or inactive")
 
         active_customer: Optional[Customer] = None
+        deployment = await load_scope(session, user.mssp_org_id)
 
         if user.role == Role.CUSTOMER_USER:
             # Customer users are HARD-PINNED to their own customer. The token
@@ -146,18 +149,24 @@ async def current_tenant_user(
             ).scalar_one_or_none()
             if active_customer is None:
                 raise HTTPException(403, "Customer not found")
+            if active_customer.mssp_org_id != user.mssp_org_id or not deployment.permits(active_customer):
+                raise HTTPException(403, "This environment is unavailable in the current deployment mode.")
             # If the client sent X-Customer and it disagrees with the token,
             # that's a tampering signal — refuse.
             if x_customer and x_customer != active_customer.codename:
                 raise HTTPException(403, "X-Customer mismatch for customer user")
         else:
-            # MSSP roles. X-Customer is optional (some endpoints work without).
+            if deployment.mode == "single":
+                if x_customer and x_customer != deployment.active_customer:
+                    raise HTTPException(403, "This environment is unavailable in the current deployment mode.")
+                x_customer = deployment.active_customer
             if x_customer:
                 active_customer = (
                     await session.execute(
                         select(Customer).where(
                             Customer.codename == x_customer,
                             Customer.mssp_org_id == user.mssp_org_id,
+                            deployment.customer_filter(),
                         )
                     )
                 ).scalar_one_or_none()
@@ -172,7 +181,7 @@ async def current_tenant_user(
             str(active_customer.id) if active_customer else None
         )
 
-        return TenantPrincipal(user=user, customer=active_customer)
+        return TenantPrincipal(user=user, customer=active_customer, deployment=deployment)
 
 
 # ---- permission gates -----------------------------------------------------
@@ -229,7 +238,10 @@ def require_feature(key: str, *, optional_customer: bool = False):
             if optional_customer:
                 return principal
             raise HTTPException(400, CUSTOMER_SELECTION_REQUIRED_MESSAGE)
-        if not customer_features.is_enabled(principal.customer.features, key):
+        if (
+            (principal.customer.sample_dataset is not None and key in SAMPLE_DISABLED_FEATURES)
+            or not customer_features.is_enabled(principal.customer.features, key)
+        ):
             raise HTTPException(
                 403,
                 f"Feature '{key}' is disabled for this customer",

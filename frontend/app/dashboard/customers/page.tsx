@@ -52,6 +52,7 @@ import {
   updateCustomerUser,
 } from '@/lib/api';
 import { notifyFeaturesChanged } from '@/lib/features';
+import { useDeployment } from '@/lib/deployment';
 import ProfileTab from './ProfileTab';
 
 const SECTOR_OPTIONS = [
@@ -78,6 +79,8 @@ const STATUS_BLURB: Record<CustomerStatus, string> = {
 };
 
 export default function CustomersPage() {
+  const deployment = useDeployment();
+  const singleEnvironment = deployment?.mode === 'single';
   const [items, setItems] = useState<CustomerOut[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -112,6 +115,18 @@ export default function CustomersPage() {
     for (const r of items) c[r.status] = (c[r.status] ?? 0) + 1;
     return c;
   }, [items]);
+
+  if (singleEnvironment) {
+    return (
+      <EnvironmentPage
+        customer={items.find((item) => item.codename === deployment.active_customer)}
+        canEdit={deployment.can_edit}
+        loading={loading}
+        error={error}
+        onSaved={reload}
+      />
+    );
+  }
 
   return (
     <Box sx={{ display: 'flex', flexDirection: 'column', gap: 3 }}>
@@ -195,9 +210,12 @@ export default function CustomersPage() {
                   sx={{ cursor: 'pointer' }}
                 >
                   <TableCell>
-                    <Typography variant="body2" sx={{ fontWeight: 500 }}>
-                      {c.name}
-                    </Typography>
+                    <Stack direction="row" spacing={1} alignItems="center">
+                      <Typography variant="body2" sx={{ fontWeight: 500 }}>{c.name}</Typography>
+                      {deployment?.environments.some((env) => env.codename === c.codename && env.is_sample) && (
+                        <Chip label="Sample" size="small" color="info" variant="outlined" />
+                      )}
+                    </Stack>
                     <Typography
                       variant="caption"
                       color="text.secondary"
@@ -377,6 +395,55 @@ function CreateDrawer({
 
 type EditTab = 'overview' | 'profile' | 'users' | 'features';
 
+function EnvironmentPage({
+  customer,
+  canEdit,
+  loading,
+  error,
+  onSaved,
+}: {
+  customer?: CustomerOut;
+  canEdit: boolean;
+  loading: boolean;
+  error: string | null;
+  onSaved: () => void;
+}) {
+  const [tab, setTab] = useState<EditTab>('profile');
+
+  return (
+    <Stack spacing={3}>
+      <Typography variant="h4" sx={{ fontWeight: 700, letterSpacing: '-0.02em' }}>
+        Environment
+      </Typography>
+      {error && <Alert severity="error">{error}</Alert>}
+      {loading && !customer && <CircularProgress size={24} />}
+      {!loading && !customer && !error && (
+        <Alert severity="info">Choose an active environment in Settings → Deployment.</Alert>
+      )}
+      {customer && (
+        <>
+          <Tabs
+            value={tab}
+            onChange={(_, value: EditTab) => setTab(value)}
+            sx={{ borderBottom: 1, borderColor: 'divider' }}
+          >
+            <Tab label="Profile" value="profile" />
+            {canEdit && <Tab label="Overview" value="overview" />}
+            {canEdit && <Tab label="Users" value="users" />}
+            {canEdit && <Tab label="Features" value="features" />}
+          </Tabs>
+          {tab === 'profile' && <ProfileTab customer={customer} />}
+          {tab === 'overview' && canEdit && (
+            <OverviewTab customer={customer} onSaved={onSaved} singleEnvironment />
+          )}
+          {tab === 'users' && canEdit && <UsersTab customer={customer} />}
+          {tab === 'features' && canEdit && <FeaturesTab customer={customer} />}
+        </>
+      )}
+    </Stack>
+  );
+}
+
 function EditDrawer({
   customer,
   onSaved,
@@ -462,9 +529,11 @@ function EditDrawer({
 function OverviewTab({
   customer,
   onSaved,
+  singleEnvironment = false,
 }: {
   customer: CustomerOut;
   onSaved: () => void;
+  singleEnvironment?: boolean;
 }) {
   const [name, setName] = useState(customer.name);
   const [sector, setSector] = useState(customer.sector ?? '');
@@ -512,9 +581,11 @@ function OverviewTab({
 
   return (
     <Stack spacing={2}>
-      <Typography variant="caption" color="text.secondary">
-        {STATUS_BLURB[status]}
-      </Typography>
+      {!singleEnvironment && (
+        <Typography variant="caption" color="text.secondary">
+          {STATUS_BLURB[status]}
+        </Typography>
+      )}
       <TextField
         size="small"
         label="Display name"
@@ -552,78 +623,82 @@ function OverviewTab({
         </Button>
       </Stack>
 
-      <Typography
-        variant="overline"
-        sx={{ fontWeight: 700, color: 'text.secondary', mt: 2 }}
-      >
-        Lifecycle
-      </Typography>
-      <Stack direction="row" spacing={1} flexWrap="wrap" useFlexGap>
-        {status === 'active' && (
-          <Tooltip title="Pause analyst access. Data is preserved.">
-            <Button
-              variant="outlined"
-              color="warning"
-              size="small"
-              startIcon={<PauseCircleOutlineRoundedIcon />}
-              onClick={() =>
-                transition(
-                  'suspended',
-                  `Suspend ${customer.name}? Analysts will lose access until you reactivate.`,
-                )
-              }
-              disabled={busy}
-            >
-              Suspend
-            </Button>
-          </Tooltip>
-        )}
-        {status === 'suspended' && (
-          <Tooltip title="Restore analyst access.">
-            <Button
-              variant="outlined"
-              color="success"
-              size="small"
-              startIcon={<PlayCircleOutlineRoundedIcon />}
-              onClick={() => transition('active')}
-              disabled={busy}
-            >
-              Reactivate
-            </Button>
-          </Tooltip>
-        )}
-        {(status === 'active' || status === 'suspended') && (
-          <Tooltip title="Terminal. The tenant becomes read-only. Schema remains for audit.">
-            <Button
-              variant="outlined"
-              color="error"
-              size="small"
-              startIcon={<ArchiveRoundedIcon />}
-              onClick={() =>
-                transition(
-                  'archived',
-                  `Archive ${customer.name}? This is a one-way action. The tenant becomes read-only.`,
-                )
-              }
-              disabled={busy}
-            >
-              Archive
-            </Button>
-          </Tooltip>
-        )}
-        {status === 'provisioning' && (
-          <Typography variant="caption" color="text.secondary">
-            Wait for provisioning to complete — status will flip to{' '}
-            <strong>active</strong> automatically.
+      {!singleEnvironment && (
+        <>
+          <Typography
+            variant="overline"
+            sx={{ fontWeight: 700, color: 'text.secondary', mt: 2 }}
+          >
+            Lifecycle
           </Typography>
-        )}
-        {status === 'archived' && (
-          <Typography variant="caption" color="text.secondary">
-            Archived tenants are not editable via the UI. Contact ops to
-            restore.
-          </Typography>
-        )}
-      </Stack>
+          <Stack direction="row" spacing={1} flexWrap="wrap" useFlexGap>
+            {status === 'active' && (
+              <Tooltip title="Pause analyst access. Data is preserved.">
+                <Button
+                  variant="outlined"
+                  color="warning"
+                  size="small"
+                  startIcon={<PauseCircleOutlineRoundedIcon />}
+                  onClick={() =>
+                    transition(
+                      'suspended',
+                      `Suspend ${customer.name}? Analysts will lose access until you reactivate.`,
+                    )
+                  }
+                  disabled={busy}
+                >
+                  Suspend
+                </Button>
+              </Tooltip>
+            )}
+            {status === 'suspended' && (
+              <Tooltip title="Restore analyst access.">
+                <Button
+                  variant="outlined"
+                  color="success"
+                  size="small"
+                  startIcon={<PlayCircleOutlineRoundedIcon />}
+                  onClick={() => transition('active')}
+                  disabled={busy}
+                >
+                  Reactivate
+                </Button>
+              </Tooltip>
+            )}
+            {(status === 'active' || status === 'suspended') && (
+              <Tooltip title="Terminal. The tenant becomes read-only. Schema remains for audit.">
+                <Button
+                  variant="outlined"
+                  color="error"
+                  size="small"
+                  startIcon={<ArchiveRoundedIcon />}
+                  onClick={() =>
+                    transition(
+                      'archived',
+                      `Archive ${customer.name}? This is a one-way action. The tenant becomes read-only.`,
+                    )
+                  }
+                  disabled={busy}
+                >
+                  Archive
+                </Button>
+              </Tooltip>
+            )}
+            {status === 'provisioning' && (
+              <Typography variant="caption" color="text.secondary">
+                Wait for provisioning to complete — status will flip to{' '}
+                <strong>active</strong> automatically.
+              </Typography>
+            )}
+            {status === 'archived' && (
+              <Typography variant="caption" color="text.secondary">
+                Archived tenants are not editable via the UI. Contact ops to
+                restore.
+              </Typography>
+            )}
+          </Stack>
+        </>
+      )}
     </Stack>
   );
 }

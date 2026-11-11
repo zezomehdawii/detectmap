@@ -45,6 +45,7 @@ import {
   listAttackNotifications,
 } from '@/lib/api';
 import { accent, coverage, gradients } from '../theme';
+import { useDeployment } from '@/lib/deployment';
 
 const MSSP_ROLES = new Set([
   'mssp_admin',
@@ -80,6 +81,7 @@ const STATE_LABEL: Record<string, string> = {
 
 export default function DashboardPage() {
   const router = useRouter();
+  const deployment = useDeployment();
   const [me, setMe] = useState<MeResponse | null>(null);
   const [activeCustomer, setActive] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -131,13 +133,16 @@ export default function DashboardPage() {
   // MSSP users with no active customer selected see the cross-customer
   // roll-up; once they pick one in the topbar switcher, the dashboard
   // re-renders against that tenant.
-  if (isMssp && !activeCustomer) {
+  if (isMssp && !activeCustomer && deployment?.mode !== 'single') {
     return <MSSPDashboard />;
   }
 
+  const environmentName = deployment?.environments.find((item) => item.codename === activeCustomer)?.name;
   return (
     <CustomerDashboard
-      codename={activeCustomer ?? me.customer_codename ?? '—'}
+      codename={deployment?.mode === 'single'
+        ? environmentName ?? 'Environment'
+        : activeCustomer ?? me.customer_codename ?? '—'}
     />
   );
 }

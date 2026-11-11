@@ -51,17 +51,23 @@ import logging
 import secrets
 import sys
 import uuid
-from typing import Optional
+from typing import Literal
 
 # Silence engine echo — this is a CLI, not the server.
 logging.getLogger("sqlalchemy.engine.Engine").setLevel(logging.WARNING)
 
 from sqlalchemy import delete, select, text  # noqa: E402
+from sqlalchemy.ext.asyncio import AsyncSession  # noqa: E402
 from sqlalchemy.dialects.postgresql import insert as pg_insert  # noqa: E402
 
 from app.core.security import hash_password  # noqa: E402
 from app.db.base import AsyncSessionLocal, engine  # noqa: E402
-from app.scripts.initialize_admins import configured_login_credentials, normalize_admin_email  # noqa: E402
+from app.scripts.initialize_admins import (  # noqa: E402
+    INITIALIZATION_LOCK,
+    configured_login_credentials,
+    normalize_admin_email,
+)
+from app.services.deployment import configure  # noqa: E402
 
 engine.sync_engine.echo = False  # belt-and-braces with the log level above
 
@@ -70,6 +76,7 @@ from app.models.public import (  # noqa: E402
     AuditLog,
     CustomRole,
     Customer,
+    DeploymentMode,
     MSSPOrg,
     Role,
     ScheduledJobRun,
@@ -109,46 +116,23 @@ def _dim(s: str) -> str:
 
 # ---- destruction ---------------------------------------------------------
 
-async def _drop_customer_schemas() -> list[str]:
-    """Drop every `cust_*` schema. Returns the list of dropped schemas."""
-    async with engine.begin() as conn:
-        result = await conn.execute(
-            text(
-                "SELECT schema_name FROM information_schema.schemata "
-                "WHERE schema_name LIKE 'cust\\_%' ESCAPE '\\'"
-            )
-        )
-        schemas = [row[0] for row in result.fetchall()]
-        for schema in schemas:
-            # Sanity check the name before interpolating — we only ever
-            # drop schemas that match our codename pattern.
-            if not schema.startswith("cust_") or not schema.replace("_", "").isalnum():
-                raise RuntimeError(
-                    f"refusing to drop suspicious schema name: {schema!r}"
-                )
-            await conn.execute(text(f'DROP SCHEMA "{schema}" CASCADE'))
+async def _drop_customer_schemas(session: AsyncSession) -> list[str]:
+    """Drop every customer schema within the reset transaction."""
+    result = await session.execute(
+        text("SELECT nspname FROM pg_namespace WHERE left(nspname, 5) = 'cust_'")
+    )
+    schemas = list(result.scalars())
+    for schema in schemas:
+        if not schema.startswith("cust_") or not schema.replace("_", "").isalnum():
+            raise RuntimeError(f"refusing to drop suspicious schema name: {schema!r}")
+        await session.execute(text(f'DROP SCHEMA "{schema}" CASCADE'))
     return schemas
 
 
-async def _wipe_public_tenant_state() -> None:
-    """Clear every public-schema table that holds per-org / per-user state.
-
-    Order matters — child tables before parents, even with CASCADE FKs, so
-    we don't fight ourselves on dependent rows.
-    """
-    async with AsyncSessionLocal() as session:
-        async with session.begin():
-            # Order: child tables first.
-            await session.execute(delete(UserPreferences))
-            await session.execute(delete(CustomRole))
-            await session.execute(delete(User))
-            await session.execute(delete(SuperAdmin))
-            await session.execute(delete(Customer))
-            await session.execute(delete(MSSPOrg))
-            await session.execute(delete(AuditLog))
-            await session.execute(delete(ScheduledJobRun))
-            # Recreated with fresh defaults during seeding.
-            await session.execute(delete(AppSettings))
+async def _wipe_public_tenant_state(session: AsyncSession) -> None:
+    """Clear public tenant state, child rows before parents."""
+    for model in (UserPreferences, CustomRole, User, SuperAdmin, Customer, MSSPOrg, AuditLog, ScheduledJobRun, AppSettings):
+        await session.execute(delete(model))
 
 
 # ---- seeding -------------------------------------------------------------
@@ -158,6 +142,7 @@ def _gen_password() -> str:
 
 
 async def _seed_admin(
+    session: AsyncSession,
     *,
     mssp_name: str,
     admin_email: str,
@@ -165,44 +150,59 @@ async def _seed_admin(
     super_email: str,
     super_password: str,
     use_login_defaults: bool = False,
+    deployment_mode: DeploymentMode = "multi_tenant",
+    sample_data: Literal["sample", "fresh"] = "fresh",
 ) -> None:
+    org = MSSPOrg(id=uuid.uuid4(), name=mssp_name)
+    session.add(org)
+    await session.flush()
+    session.add(
+        User(
+            id=uuid.uuid4(),
+            email=admin_email.lower(),
+            hashed_password=hash_password(admin_password),
+            auth_source="local",
+            full_name="Initial administrator",
+            role=Role.MSSP_ADMIN,
+            is_active=True,
+            mssp_org_id=org.id,
+            customer_id=None,
+            must_change_password=not use_login_defaults,
+        )
+    )
+    session.add(
+        SuperAdmin(
+            id=uuid.uuid4(),
+            email=super_email.lower(),
+            hashed_password=hash_password(super_password),
+            full_name="Initial super admin",
+            is_active=True,
+            must_change_password=True,
+        )
+    )
+    # A random password does not match the configured login card.
+    await session.execute(
+        pg_insert(AppSettings).values(singleton=True, show_login_hint=use_login_defaults)
+        .on_conflict_do_update(
+            index_elements=[AppSettings.singleton],
+            set_={"show_login_hint": use_login_defaults},
+        )
+    )
+    if deployment_mode != "multi_tenant" or sample_data == "sample":
+        await configure(
+            session, org, mode=deployment_mode, sample_data_enabled=sample_data == "sample",
+            initializing=True,
+        )
+
+
+async def _reset_deployment(**admin_options) -> list[str]:
     async with AsyncSessionLocal() as session:
         async with session.begin():
-            org = MSSPOrg(id=uuid.uuid4(), name=mssp_name)
-            session.add(org)
-            await session.flush()
-            session.add(
-                User(
-                    id=uuid.uuid4(),
-                    email=admin_email.lower(),
-                    hashed_password=hash_password(admin_password),
-                    auth_source="local",
-                    full_name="Initial administrator",
-                    role=Role.MSSP_ADMIN,
-                    is_active=True,
-                    mssp_org_id=org.id,
-                    customer_id=None,
-                    must_change_password=not use_login_defaults,
-                )
-            )
-            session.add(
-                SuperAdmin(
-                    id=uuid.uuid4(),
-                    email=super_email.lower(),
-                    hashed_password=hash_password(super_password),
-                    full_name="Initial super admin",
-                    is_active=True,
-                    must_change_password=True,
-                )
-            )
-            # A random password does not match the configured login card.
-            await session.execute(
-                pg_insert(AppSettings).values(singleton=True, show_login_hint=use_login_defaults)
-                .on_conflict_do_update(
-                    index_elements=[AppSettings.singleton],
-                    set_={"show_login_hint": use_login_defaults},
-                )
-            )
+            await session.execute(text("SELECT pg_advisory_xact_lock(:key)"), {"key": INITIALIZATION_LOCK})
+            schemas = await _drop_customer_schemas(session)
+            await _wipe_public_tenant_state(session)
+            await _seed_admin(session, **admin_options)
+    return schemas
 
 
 # ---- summary -------------------------------------------------------------
@@ -272,24 +272,19 @@ async def _amain(args: argparse.Namespace) -> int:
             print(_yellow("aborted"))
             return 1
 
-    print(_dim("→ dropping customer schemas..."))
-    schemas = await _drop_customer_schemas()
-    print(_dim(f"  dropped {len(schemas)} schema(s): {', '.join(schemas) or '(none)'}"))
-
-    print(_dim("→ wiping per-org / per-user tables..."))
-    await _wipe_public_tenant_state()
-
-    print(_dim("→ seeding initial admin + super admin..."))
-    await _seed_admin(
+    counts = await _summarise_preserved()
+    print(_dim("→ replacing customer schemas and accounts..."))
+    schemas = await _reset_deployment(
         mssp_name=args.mssp_name,
         admin_email=admin_email,
         admin_password=admin_password,
         super_email=super_email,
         super_password=super_password,
         use_login_defaults=use_login_defaults,
+        deployment_mode=args.deployment_mode,
+        sample_data=args.sample_data,
     )
-
-    counts = await _summarise_preserved()
+    print(_dim(f"  dropped {len(schemas)} schema(s): {', '.join(schemas) or '(none)'}"))
 
     print()
     print(_green(_bold("✓ factory reset complete")))
@@ -361,6 +356,8 @@ def main() -> None:
         action="store_true",
         help="Skip the typed RESET confirmation (use for unattended setup)",
     )
+    p.add_argument("--deployment-mode", choices=("single", "multi_tenant"), default="multi_tenant")
+    p.add_argument("--sample-data", choices=("sample", "fresh"), default="fresh")
     args = p.parse_args()
 
     try:

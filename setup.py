@@ -10,6 +10,7 @@ default. --reset requires an explicit confirmation before any changes.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 from urllib.parse import urlsplit
@@ -357,17 +358,48 @@ def wait_for_backend(compose: list[str], tls: bool) -> None:
     raise RuntimeError("Backend did not become healthy; inspect docker compose logs backend and rerun setup.")
 
 
-def run_initialization(compose: list[str], tls: bool, admin_email: str | None, super_email: str) -> None:
+def deployment_is_empty(compose: list[str], tls: bool) -> bool:
+    command = compose_command(compose, tls) + [
+        "exec", "-T", "backend", "python", "-m",
+        "app.scripts.initialize_admins", "--status-only",
+    ]
+    try:
+        status = json.loads(subprocess.check_output(command, cwd=REPO_ROOT, text=True, timeout=30))
+    except (ValueError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError("Could not determine whether the deployment is empty; check backend health and rerun setup.") from exc
+    if not isinstance(status, dict) or type(status.get("empty")) is not bool:
+        raise RuntimeError("The backend returned an invalid initialization status; rerun setup after checking backend health.")
+    return status["empty"]
+
+
+def choose_initial_environment() -> tuple[str, str]:
+    mode = choose("How will you use Detect Map?", [
+        ("single", "Single environment — manage one organization or site"),
+        ("multi_tenant", "Multi-tenant — manage multiple separate environments"),
+    ], default="single")
+    sample_data = choose("What data should Detect Map start with?", [
+        ("fresh", "Start fresh — no sample records"),
+        ("sample", "Add sample data — explore the Acme and Globex example environments"),
+    ], default="fresh")
+    print(d("  You can change both choices later under Settings -> Deployment."))
+    return mode, sample_data
+
+
+def run_initialization(compose: list[str], tls: bool, admin_email: str | None,
+                       super_email: str, *, mode: str, sample_data: str) -> None:
     arguments = ["exec", "-T", "backend", "python", "-m",
-                 "app.scripts.initialize_admins", "--super-email", super_email]
+                 "app.scripts.initialize_admins", "--super-email", super_email,
+                 "--deployment-mode", mode, "--sample-data", sample_data]
     if admin_email is not None:
         arguments += ["--admin-email", admin_email]
     run_compose(compose, arguments, tls=tls)
 
 
-def run_factory_reset(compose: list[str], tls: bool, admin_email: str | None, super_email: str) -> None:
+def run_factory_reset(compose: list[str], tls: bool, admin_email: str | None,
+                      super_email: str, *, mode: str, sample_data: str) -> None:
     arguments = ["exec", "-T", "backend", "python", "-m", "app.scripts.factory_reset",
-                 "--yes", "--use-login-defaults", "--super-email", super_email]
+                 "--yes", "--use-login-defaults", "--super-email", super_email,
+                 "--deployment-mode", mode, "--sample-data", sample_data]
     if admin_email is not None:
         arguments += ["--admin-email", admin_email]
     run_compose(compose, arguments, tls=tls)
@@ -475,17 +507,19 @@ def main() -> None:
     use_tls = tls_mode != "none"
     run_compose(compose, ["up", "-d", "--build"], tls=use_tls)
     wait_for_backend(compose, use_tls)
-    header("7. Initial accounts")
-    if args.reset:
-        run_factory_reset(compose, use_tls, admin_email, super_email)
+    header("7. Initial deployment")
+    if args.reset or deployment_is_empty(compose, use_tls):
+        mode, sample_data = choose_initial_environment()
+        initialize = run_factory_reset if args.reset else run_initialization
+        initialize(compose, use_tls, admin_email, super_email, mode=mode, sample_data=sample_data)
     else:
-        run_initialization(compose, use_tls, admin_email, super_email)
+        print(d("  Existing deployment detected; accounts, deployment mode, and data are unchanged."))
     header("Done")
     print(f"  Dashboard: {deployment['public_url']}")
     print("  Fresh installs use the default dashboard administrator shown on the sign-in page.")
     print("  Hide that credential card under Settings -> Branding; this does not disable the account.")
     print("  A new product super admin receives a generated temporary password and must change it on first sign-in.")
-    print("  Existing accounts and sign-in hint settings are unchanged on a normal rerun.")
+    print("  Change deployment mode or sample data under Settings -> Deployment.")
     if tls_mode == "self-signed":
         print("  Configure trust for your generated certificate before browser access.")
 

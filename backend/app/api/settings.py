@@ -11,7 +11,7 @@ import uuid
 from typing import Optional
 
 from fastapi import APIRouter, Body, Depends, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select
 
 from datetime import datetime, timezone
@@ -19,6 +19,7 @@ from datetime import datetime, timezone
 from app.api.deps import (
     TenantPrincipal,
     current_super_admin,
+    current_tenant_user,
     require_active_customer,
     require_perm,
 )
@@ -31,12 +32,16 @@ from app.models.public import (
     AttackCatalogVersion,
     AuditLog,
     Customer,
+    CustomerStatus,
+    DeploymentMode,
     MSSPOrg,
     Role,
     ScheduledJobRun,
     SuperAdmin,
     User,
 )
+from app.services import deployment
+from app.services.roles import user_has_permission
 
 router = APIRouter(prefix="/settings", tags=["settings"])
 
@@ -68,6 +73,100 @@ async def _record_audit(
             at=datetime.now(timezone.utc),
         )
     )
+
+
+# ---- Environment and sample data -----------------------------------------
+
+class EnvironmentOption(BaseModel):
+    codename: str
+    name: str
+    is_sample: bool
+
+
+class EnvironmentSettingsOut(BaseModel):
+    mode: DeploymentMode
+    sample_data_enabled: bool
+    primary_customer: str | None
+    active_customer: str | None
+    environments: list[EnvironmentOption]
+    can_edit: bool
+
+
+class EnvironmentSettingsPatch(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    mode: DeploymentMode | None = None
+    sample_data_enabled: bool | None = None
+    primary_customer: str | None = Field(default=None, pattern=r"^[a-z][a-z0-9_]{1,30}$")
+
+
+def _environment_out(org: MSSPOrg, workspaces: list[Customer], can_edit: bool) -> EnvironmentSettingsOut:
+    scope = deployment.DeploymentScope.from_org(org)
+    options = [
+        EnvironmentOption(codename=customer.codename, name=customer.name, is_sample=customer.sample_dataset is not None)
+        for customer in workspaces
+        if customer.status == CustomerStatus.ACTIVE and (
+            scope.permits(customer)
+            or (can_edit and (scope.sample_data_enabled or customer.sample_dataset is None))
+        )
+    ]
+    selected = org.single_customer if any(option.codename == org.single_customer for option in options) else None
+    return EnvironmentSettingsOut(
+        mode=scope.mode,
+        sample_data_enabled=scope.sample_data_enabled,
+        primary_customer=selected if can_edit else scope.active_customer,
+        active_customer=scope.active_customer,
+        environments=options,
+        can_edit=can_edit,
+    )
+
+
+async def _can_edit_environment(principal: TenantPrincipal) -> bool:
+    return principal.user.role == Role.MSSP_ADMIN and await user_has_permission(
+        principal.user, Permission.CUSTOMER_PROVISION
+    )
+
+
+@router.get("/mssp/environment", response_model=EnvironmentSettingsOut)
+async def get_environment_settings(
+    principal: TenantPrincipal = Depends(current_tenant_user),
+) -> EnvironmentSettingsOut:
+    if principal.user.role == Role.CUSTOMER_USER:
+        raise HTTPException(403, "Environment settings are for dashboard staff.")
+    can_edit = await _can_edit_environment(principal)
+    async with AsyncSessionLocal() as session:
+        org = await deployment.get_org(session, principal.user.mssp_org_id)
+        if org is None:
+            raise HTTPException(403, "User has no MSSP org")
+        return _environment_out(org, await deployment.list_workspaces(session, org.id), can_edit)
+
+
+@router.patch("/mssp/environment", response_model=EnvironmentSettingsOut)
+async def patch_environment_settings(
+    payload: EnvironmentSettingsPatch,
+    principal: TenantPrincipal = Depends(current_tenant_user),
+) -> EnvironmentSettingsOut:
+    if not await _can_edit_environment(principal):
+        raise HTTPException(403, "Only a dashboard administrator can change environment settings.")
+    async with AsyncSessionLocal() as session:
+        async with session.begin():
+            org = await deployment.get_org(session, principal.user.mssp_org_id, for_update=True)
+            if org is None:
+                raise HTTPException(403, "User has no MSSP org")
+            try:
+                workspaces = await deployment.configure(session, org, **payload.model_dump())
+            except ValueError as exc:
+                raise HTTPException(422, str(exc)) from exc
+            response = _environment_out(org, workspaces, can_edit=True)
+            await _record_audit(
+                session,
+                actor_email=principal.user.email,
+                actor_kind="user",
+                action="deployment_settings_update",
+                target=str(org.id),
+                detail=f"mode={response.mode}, sample_data={response.sample_data_enabled}, primary={response.primary_customer}",
+            )
+        return response
 
 
 # ---- MSSP branding -------------------------------------------------------
@@ -1118,11 +1217,13 @@ async def _validate_customer_for_role(session, org_id, role: str, customer_id: O
     if role == "customer_user":
         if not customer_id:
             raise HTTPException(422, "customer_user requires a customer_id")
+        scope = await deployment.load_scope(session, org_id)
         cust = (
             await session.execute(
                 select(Customer).where(
                     Customer.id == uuid.UUID(customer_id),
                     Customer.mssp_org_id == org_id,
+                    scope.customer_filter(),
                 )
             )
         ).scalar_one_or_none()

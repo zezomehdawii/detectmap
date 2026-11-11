@@ -24,6 +24,7 @@ from app.db.base import AsyncSessionLocal
 from app.db.tenant import set_tenant, tenant_session
 from app.models.customer import Detection, DetectionSource, DetectionStatus, DetectionTechnique
 from app.models.public import Customer
+from app.services.deployment import DeploymentScope
 
 
 @dataclass
@@ -44,6 +45,8 @@ async def find_suggestions(
     mssp_org_id: str,
     active_codename: str,
     active_sector: Optional[str],
+    scope: DeploymentScope = DeploymentScope(),
+    sample_workspace: bool = False,
     limit: int = 20,
 ) -> list[PromotionSuggestion]:
     try:
@@ -57,6 +60,8 @@ async def find_suggestions(
                 select(Customer).where(
                     Customer.mssp_org_id == org_uuid,
                     Customer.codename != active_codename,
+                    scope.customer_filter(),
+                    Customer.sample_dataset.is_not(None) if sample_workspace else Customer.sample_dataset.is_(None),
                 )
             )
         ).scalars().all()
@@ -151,6 +156,7 @@ async def promote_to_active(
     source_codename: str,
     source_detection_id: str,
     target_codename: str,
+    scope: DeploymentScope = DeploymentScope(),
 ) -> dict:
     """Copy a detection from one sibling tenant to another within the same MSSP.
 
@@ -173,6 +179,7 @@ async def promote_to_active(
                 select(Customer).where(
                     Customer.mssp_org_id == org_uuid,
                     Customer.codename.in_([source_codename, target_codename]),
+                    scope.customer_filter(),
                 )
             )
         ).scalars().all()
@@ -181,6 +188,8 @@ async def promote_to_active(
         raise ValueError("one or both customers not in your MSSP org")
     if source_codename == target_codename:
         raise ValueError("source and target customers must differ")
+    if bool(by_code[source_codename].sample_dataset) != bool(by_code[target_codename].sample_dataset):
+        raise PermissionError("Rules cannot be promoted between sample and operational environments.")
 
     # Read source rule and its technique mappings.
     set_tenant(source_codename)

@@ -7,6 +7,7 @@ from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel
 
 from app.api.deps import TenantPrincipal, current_tenant_user
+from app.models.public import Role
 from app.services.search import global_search
 
 router = APIRouter(prefix="/search", tags=["search"])
@@ -37,13 +38,14 @@ async def search(
     """
     org_id = (
         str(principal.user.mssp_org_id)
-        if principal.user.mssp_org_id is not None
+        if principal.user.mssp_org_id is not None and principal.user.role != Role.CUSTOMER_USER
         else None
     )
     results = await global_search(
         q,
         has_tenant=principal.customer is not None,
         mssp_org_id=org_id,
+        deployment=principal.deployment,
     )
     return SearchOut(
         query=results.query,

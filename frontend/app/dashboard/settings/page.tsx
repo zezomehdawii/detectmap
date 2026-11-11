@@ -81,9 +81,11 @@ import {
   updateCustomRole,
   updateSettingsUser,
 } from '@/lib/api';
+import DeploymentTab from './DeploymentTab';
 
 type TabKey =
   | 'branding'
+  | 'deployment'
   | 'catalog'
   | 'ai'
   | 'schedule'
@@ -105,17 +107,19 @@ export default function SettingsPage() {
           Settings
         </Typography>
         <Typography variant="body2" color="text.secondary">
-          Branding, AI authoring, catalog refresh schedule, ATT&amp;CK release
-          diffs, and user management.
+          Deployment, branding, catalog updates, and user management.
         </Typography>
       </Box>
 
       <Tabs
         value={tab}
         onChange={(_, v) => setTab(v as TabKey)}
+        variant="scrollable"
+        scrollButtons="auto"
         sx={{ borderBottom: 1, borderColor: 'divider' }}
       >
         <Tab label="Branding" value="branding" />
+        <Tab label="Deployment" value="deployment" />
         <Tab label="AI authoring" value="ai" />
         <Tab label="Active Directory" value="ldap" />
         <Tab label="Mail server" value="mail" />
@@ -127,6 +131,7 @@ export default function SettingsPage() {
       </Tabs>
 
       {tab === 'branding' && <BrandingTab />}
+      {tab === 'deployment' && <DeploymentTab />}
       {tab === 'ai' && <AITab />}
       {tab === 'ldap' && <LdapTab />}
       {tab === 'mail' && <MailTab />}

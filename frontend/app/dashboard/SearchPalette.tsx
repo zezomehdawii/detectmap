@@ -48,9 +48,11 @@ const HREF_BY_KIND: Record<string, (id: string) => string> = {
 export function SearchPalette({
   open,
   onClose,
+  singleEnvironment,
 }: {
   open: boolean;
   onClose: () => void;
+  singleEnvironment: boolean;
 }) {
   const router = useRouter();
   const [query, setQuery] = useState('');
@@ -87,7 +89,7 @@ export function SearchPalette({
     globalSearch(debounced)
       .then((h) => {
         if (!cancelled) {
-          setHits(h);
+          setHits(singleEnvironment ? h.filter((hit) => hit.kind !== 'customer') : h);
           setActive(0);
         }
       })
@@ -100,7 +102,7 @@ export function SearchPalette({
     return () => {
       cancelled = true;
     };
-  }, [debounced]);
+  }, [debounced, singleEnvironment]);
 
   function go(hit: SearchHit) {
     const href = hit.href ?? HREF_BY_KIND[hit.kind]?.(hit.id) ?? null;
@@ -163,7 +165,9 @@ export function SearchPalette({
         >
           <SearchRoundedIcon fontSize="small" color="action" />
           <InputBase
-            placeholder="Search techniques, detections, APTs, customers…"
+            placeholder={singleEnvironment
+              ? 'Search techniques, detections, APTs…'
+              : 'Search techniques, detections, APTs, customers…'}
             value={query}
             onChange={(e) => setQuery(e.target.value)}
             inputRef={inputRef}

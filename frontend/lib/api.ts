@@ -9,6 +9,8 @@ import {
 const baseURL =
   process.env.NEXT_PUBLIC_API_BASE ?? 'http://localhost:8000';
 
+const ENVIRONMENT_SETTINGS_URL = '/settings/mssp/environment';
+
 export const CUSTOMER_SELECTION_REQUIRED_MESSAGE =
   'Select a customer to continue. Use the customer switcher in the header.';
 
@@ -110,11 +112,12 @@ api.interceptors.request.use((config) => {
     config.headers = config.headers ?? {};
     config.headers.Authorization = `Bearer ${token}`;
   }
-  // Per-call X-Customer override wins. Pages that operate on an
-  // arbitrary customer (e.g. the customer-drawer profile) set the header
-  // explicitly; everything else falls back to the active customer
-  // from the topbar switcher.
-  if (!config.headers?.['X-Customer']) {
+  // Auth and environment discovery must work before a stored tenant choice
+  // has been checked, including after that sample environment was hidden.
+  const unscoped = config.url === '/auth/me' ||
+    config.url === ENVIRONMENT_SETTINGS_URL ||
+    (config.url === '/customers' && config.method === 'get');
+  if (!unscoped && !config.headers?.['X-Customer']) {
     const customer = getActiveCustomer();
     if (customer) {
       config.headers = config.headers ?? {};
@@ -196,6 +199,34 @@ export async function login(
 
 export async function fetchMe(): Promise<MeResponse> {
   const { data } = await api.get<MeResponse>('/auth/me');
+  return data;
+}
+
+export type DeploymentMode = 'single' | 'multi_tenant';
+
+export interface DeploymentSettings {
+  mode: DeploymentMode;
+  sample_data_enabled: boolean;
+  primary_customer: string | null;
+  active_customer: string | null;
+  environments: { codename: string; name: string; is_sample: boolean }[];
+  can_edit: boolean;
+}
+
+export async function getDeploymentSettings(): Promise<DeploymentSettings> {
+  const { data } = await api.get<DeploymentSettings>(ENVIRONMENT_SETTINGS_URL);
+  return data;
+}
+
+export async function patchDeploymentSettings(payload: {
+  mode?: DeploymentMode;
+  sample_data_enabled?: boolean;
+  primary_customer?: string;
+}): Promise<DeploymentSettings> {
+  const { data } = await api.patch<DeploymentSettings>(ENVIRONMENT_SETTINGS_URL, payload, {
+    // Enabling samples can provision the example environments and load their records.
+    timeout: 180_000,
+  });
   return data;
 }
 

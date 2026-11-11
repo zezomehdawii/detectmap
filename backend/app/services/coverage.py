@@ -293,12 +293,20 @@ async def _fetch_tenant_coverage(
     return dict(agg)
 
 
+async def _load_tenant_coverage(denom: set[str], session: AsyncSession | None) -> dict[str, dict]:
+    if session is not None:
+        return await _fetch_tenant_coverage(session, denom)
+    async with tenant_session() as tenant:
+        return await _fetch_tenant_coverage(tenant, denom)
+
+
 async def compute_matrix(
     domain: str,
     kind: DenominatorKind,
     ref: Optional[str],
     *,
     precomputed_denominator: Optional[set[str]] = None,
+    session: AsyncSession | None = None,
 ) -> CoverageMatrix:
     """Build the tactic-column / technique-cell matrix for the active tenant.
 
@@ -313,8 +321,7 @@ async def compute_matrix(
         else await compute_denominator(domain, kind, ref)
     )
 
-    async with tenant_session() as session:
-        coverage = await _fetch_tenant_coverage(session, denom)
+    coverage = await _load_tenant_coverage(denom, session)
 
     by_tactic: dict[str, list[TechniqueCell]] = {t: [] for t in TACTIC_ORDER}
 
@@ -414,6 +421,7 @@ async def compute_score(
     ref: Optional[str],
     *,
     precomputed_denominator: Optional[set[str]] = None,
+    session: AsyncSession | None = None,
 ) -> CoverageScore:
     denom = (
         precomputed_denominator
@@ -436,8 +444,7 @@ async def compute_score(
             posture_grade="D",
             state_counts={s.value: 0 for s in CoverageState},
         )
-    async with tenant_session() as session:
-        coverage = await _fetch_tenant_coverage(session, denom)
+    coverage = await _load_tenant_coverage(denom, session)
 
     state_counts: dict[str, int] = defaultdict(int)
     covered = 0
@@ -490,10 +497,11 @@ async def save_snapshot(
     ref: Optional[str],
     *,
     notes: Optional[str] = None,
+    session: AsyncSession | None = None,
 ) -> CoverageSnapshot:
     """Persist a point-in-time roll-up of (matrix + score) for audit history."""
-    score = await compute_score(domain, kind, ref)
-    matrix = await compute_matrix(domain, kind, ref)
+    score = await compute_score(domain, kind, ref, session=session)
+    matrix = await compute_matrix(domain, kind, ref, session=session)
     # Flatten matrix cells to one (technique_id -> state) map so a later
     # snapshot can diff against this one cell-by-cell. Each technique
     # appears once per tactic in by_tactic; collapse to a single entry.
@@ -520,24 +528,29 @@ async def save_snapshot(
         "technique_states": technique_states,
         "technique_depth": technique_depth,
     }
-    async with tenant_session() as session:
-        snap = CoverageSnapshot(
-            id=uuid.uuid4(),
-            denominator_kind=kind.value,
-            denominator_ref=ref,
-            breadth_score=score.breadth_grade,
-            depth_score=score.depth_grade,
-            posture_grade=score.posture_grade,
-            payload=payload,
-            notes=notes,
-        )
-        session.add(snap)
-        await session.flush()
-        # Re-load to capture server defaults (taken_at).
-        await session.refresh(snap)
-        # Detach so callers can read attributes after the session closes.
-        session.expunge(snap)
+    snap = CoverageSnapshot(
+        id=uuid.uuid4(),
+        denominator_kind=kind.value,
+        denominator_ref=ref,
+        breadth_score=score.breadth_grade,
+        depth_score=score.depth_grade,
+        posture_grade=score.posture_grade,
+        payload=payload,
+        notes=notes,
+    )
+    if session is None:
+        async with tenant_session() as tenant:
+            await _insert_snapshot(tenant, snap)
+    else:
+        await _insert_snapshot(session, snap)
     return snap
+
+
+async def _insert_snapshot(session: AsyncSession, snap: CoverageSnapshot) -> None:
+    session.add(snap)
+    await session.flush()
+    await session.refresh(snap)
+    session.expunge(snap)
 
 
 async def list_snapshots(*, limit: int = 50) -> list[CoverageSnapshot]:

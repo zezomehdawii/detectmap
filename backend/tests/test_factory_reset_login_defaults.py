@@ -15,6 +15,7 @@ def arguments(**overrides):
         mssp_name="Test MSSP", admin_email=None, admin_password=None,
         super_email="super@example.local", super_password=None,
         use_login_defaults=True, yes=True,
+        deployment_mode="single", sample_data="sample",
     )
     values.update(overrides)
     return argparse.Namespace(**values)
@@ -23,12 +24,10 @@ def arguments(**overrides):
 @pytest.fixture
 def reset_calls(monkeypatch):
     calls = SimpleNamespace(
-        drop=AsyncMock(return_value=[]), wipe=AsyncMock(), seed=AsyncMock(),
+        reset=AsyncMock(return_value=[]),
         counts=AsyncMock(return_value={}), generate=Mock(return_value="super-temporary"),
     )
-    monkeypatch.setattr(reset, "_drop_customer_schemas", calls.drop)
-    monkeypatch.setattr(reset, "_wipe_public_tenant_state", calls.wipe)
-    monkeypatch.setattr(reset, "_seed_admin", calls.seed)
+    monkeypatch.setattr(reset, "_reset_deployment", calls.reset)
     monkeypatch.setattr(reset, "_summarise_preserved", calls.counts)
     monkeypatch.setattr(reset, "_gen_password", calls.generate)
     monkeypatch.setattr(initial, "settings", SimpleNamespace(
@@ -40,12 +39,11 @@ def reset_calls(monkeypatch):
 @pytest.mark.asyncio
 async def test_opted_in_reset_uses_matching_dashboard_defaults_and_generated_super(reset_calls, capsys):
     assert await reset._amain(arguments()) == 0
-    reset_calls.drop.assert_awaited_once()
-    reset_calls.wipe.assert_awaited_once()
     reset_calls.generate.assert_called_once()
-    reset_calls.seed.assert_awaited_once_with(
+    reset_calls.reset.assert_awaited_once_with(
         mssp_name="Test MSSP", admin_email="admin@demo.local", admin_password="change-me",
         super_email="super@example.local", super_password="super-temporary", use_login_defaults=True,
+        deployment_mode="single", sample_data="sample",
     )
     output = capsys.readouterr().out
     assert "Settings -> Branding" in output
@@ -70,9 +68,7 @@ async def test_opted_in_reset_rejects_invalid_hint_before_destructive_calls(
     ))
     with pytest.raises(ValueError, match=error):
         await reset._amain(arguments(**overrides))
-    reset_calls.drop.assert_not_awaited()
-    reset_calls.wipe.assert_not_awaited()
-    reset_calls.seed.assert_not_awaited()
+    reset_calls.reset.assert_not_awaited()
     reset_calls.generate.assert_not_called()
 
 
@@ -81,9 +77,10 @@ async def test_legacy_reset_still_generates_two_passwords_with_legacy_email(rese
     reset_calls.generate.side_effect = ["admin-temporary", "super-temporary"]
     assert await reset._amain(arguments(use_login_defaults=False)) == 0
     assert reset_calls.generate.call_count == 2
-    reset_calls.seed.assert_awaited_once_with(
+    reset_calls.reset.assert_awaited_once_with(
         mssp_name="Test MSSP", admin_email="admin@detectmap.local", admin_password="admin-temporary",
         super_email="super@example.local", super_password="super-temporary", use_login_defaults=False,
+        deployment_mode="single", sample_data="sample",
     )
     assert "Both accounts will be required" in capsys.readouterr().out
 
@@ -92,30 +89,17 @@ async def test_legacy_reset_still_generates_two_passwords_with_legacy_email(rese
 async def test_cancelled_reset_never_reaches_destructive_calls(monkeypatch, reset_calls):
     monkeypatch.setattr("builtins.input", lambda _: "cancel")
     assert await reset._amain(arguments(yes=False)) == 1
-    reset_calls.drop.assert_not_awaited()
-    reset_calls.wipe.assert_not_awaited()
-    reset_calls.seed.assert_not_awaited()
-
-
-class Context:
-    def __init__(self, value=None):
-        self.value = value
-
-    async def __aenter__(self):
-        return self.value
-
-    async def __aexit__(self, *args):
-        return None
+    reset_calls.reset.assert_not_awaited()
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("use_defaults", [True, False])
 async def test_seeded_hint_and_dashboard_rotation_match_selected_mode(monkeypatch, use_defaults):
     added = []
-    session = SimpleNamespace(add=added.append, flush=AsyncMock(), execute=AsyncMock(), begin=lambda: Context())
-    monkeypatch.setattr(reset, "AsyncSessionLocal", lambda: Context(session))
+    session = SimpleNamespace(add=added.append, flush=AsyncMock(), execute=AsyncMock())
     monkeypatch.setattr(reset, "hash_password", lambda value: "hashed:" + value)
     await reset._seed_admin(
+        session,
         mssp_name="Test", admin_email="admin@example.local", admin_password="dashboard-password",
         super_email="super@example.local", super_password="super-temporary", use_login_defaults=use_defaults,
     )

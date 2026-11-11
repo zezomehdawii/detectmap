@@ -20,8 +20,8 @@ from app.core.security import hash_password
 from app.db.base import AsyncSessionLocal
 from app.db.tenant import schema_for
 from app.models.public import Customer, CustomerStatus, CustomRole, Role, User
-from app.services import customer_features
-from app.services.provisioning import provision_customer
+from app.services import customer_features, deployment
+from app.services.provisioning import provisioned_customer
 
 router = APIRouter(prefix="/customers", tags=["customers"])
 
@@ -45,6 +45,7 @@ class CustomerOut(BaseModel):
     sector: Optional[str]
     status: str
     schema_name: str
+    is_sample: bool = False
     created_at: Optional[datetime] = None
 
 
@@ -56,6 +57,7 @@ def _serialize(c: Customer) -> CustomerOut:
         sector=c.sector,
         status=c.status.value,
         schema_name=schema_for(c.codename),
+        is_sample=c.sample_dataset is not None,
         created_at=c.created_at,
     )
 
@@ -80,7 +82,8 @@ async def list_customers(
             stmt = select(Customer).where(Customer.id == principal.user.customer_id)
         else:
             stmt = select(Customer).where(
-                Customer.mssp_org_id == principal.user.mssp_org_id
+                Customer.mssp_org_id == principal.user.mssp_org_id,
+                principal.deployment.customer_filter(),
             )
         rows = (await session.execute(stmt)).scalars().all()
         return [_serialize(c) for c in rows]
@@ -95,40 +98,26 @@ async def create_customer(
         raise HTTPException(400, "Caller has no MSSP org")
 
     async with AsyncSessionLocal() as session:
-        existing = (
-            await session.execute(
-                select(Customer).where(
-                    Customer.mssp_org_id == principal.user.mssp_org_id,
-                    Customer.codename == payload.codename,
-                )
+        async with session.begin():
+            org = await deployment.get_org(session, principal.user.mssp_org_id, for_update=True)
+            if org is None:
+                raise HTTPException(400, "Caller has no MSSP org")
+            if org.deployment_mode == "single":
+                raise HTTPException(409, "Switch to multi-tenant mode before adding another environment.")
+            if not await deployment.codename_available(session, payload.codename):
+                raise HTTPException(409, "Codename already used")
+            customer = Customer(
+                id=uuid.uuid4(),
+                mssp_org_id=org.id,
+                codename=payload.codename,
+                name=payload.name,
+                sector=payload.sector,
+                status=CustomerStatus.ACTIVE,
             )
-        ).scalar_one_or_none()
-        if existing:
-            raise HTTPException(409, "Codename already used in this MSSP")
-
-        customer = Customer(
-            id=uuid.uuid4(),
-            mssp_org_id=principal.user.mssp_org_id,
-            codename=payload.codename,
-            name=payload.name,
-            sector=payload.sector,
-            status=CustomerStatus.PROVISIONING,
-        )
-        session.add(customer)
-        await session.commit()
-        await session.refresh(customer)
-
-    # Provisioning is synchronous here for v1; queue this onto Celery once
-    # default-catalog copy (~3,300 rules) is wired up.
-    await provision_customer(customer.codename)
-
-    async with AsyncSessionLocal() as session:
-        customer = (
-            await session.execute(select(Customer).where(Customer.id == customer.id))
-        ).scalar_one()
-        customer.status = CustomerStatus.ACTIVE
-        await session.commit()
-        await session.refresh(customer)
+            session.add(customer)
+            await session.flush()
+            async with provisioned_customer(session, customer.codename):
+                pass
         return _serialize(customer)
 
 
@@ -142,7 +131,10 @@ async def get_customer(
         if principal.user.role == Role.CUSTOMER_USER:
             stmt = stmt.where(Customer.id == principal.user.customer_id)
         else:
-            stmt = stmt.where(Customer.mssp_org_id == principal.user.mssp_org_id)
+            stmt = stmt.where(
+                Customer.mssp_org_id == principal.user.mssp_org_id,
+                principal.deployment.customer_filter(),
+            )
         customer = (await session.execute(stmt)).scalar_one_or_none()
         if customer is None:
             raise HTTPException(404, "Customer not found")
@@ -164,18 +156,17 @@ async def patch_customer(
         raise HTTPException(400, "Caller has no MSSP org")
 
     async with AsyncSessionLocal() as session:
-        customer = (
-            await session.execute(
-                select(Customer).where(
-                    Customer.codename == codename,
-                    Customer.mssp_org_id == principal.user.mssp_org_id,
-                )
-            )
-        ).scalar_one_or_none()
-        if customer is None:
-            raise HTTPException(404, "Customer not found")
+        org = await deployment.get_org(session, principal.user.mssp_org_id, for_update=True)
+        if org is None:
+            raise HTTPException(403, "Caller has no MSSP org")
+        scope = deployment.DeploymentScope.from_org(org)
+        customer = await _load_customer_or_404(session, codename, org.id, scope=scope)
 
         if payload.status is not None and payload.status != customer.status:
+            if scope.mode == "single":
+                raise HTTPException(409, "Change the active environment in Settings before changing this status.")
+            if customer.sample_dataset is not None:
+                raise HTTPException(409, "Use Environment settings to show or hide sample workspaces.")
             allowed = _ALLOWED_TRANSITIONS.get(customer.status, set())
             if payload.status not in allowed:
                 raise HTTPException(
@@ -230,12 +221,17 @@ class CustomerUserPatch(BaseModel):
     custom_role_id: Optional[str] = None
 
 
-async def _load_customer_or_404(session, codename: str, org_id) -> Customer:
+async def _load_customer_or_404(
+    session, codename: str, org_id, *, scope: deployment.DeploymentScope | None = None,
+) -> Customer:
+    if scope is None:
+        scope = await deployment.load_scope(session, org_id)
     row = (
         await session.execute(
             select(Customer).where(
                 Customer.codename == codename,
                 Customer.mssp_org_id == org_id,
+                scope.customer_filter(),
             )
         )
     ).scalar_one_or_none()
@@ -519,6 +515,8 @@ async def patch_customer_features(
         )
         if customer.status == CustomerStatus.ARCHIVED:
             raise HTTPException(409, "Archived customer is read-only")
+        if customer.sample_dataset is not None and any(cleaned.get(key) for key in deployment.SAMPLE_DISABLED_FEATURES):
+            raise HTTPException(409, "Live connector tests and shared GRC edits are unavailable in sample workspaces.")
         merged = dict(customer.features or {})
         merged.update(cleaned)
         customer.features = merged

@@ -126,6 +126,25 @@ async def test_fresh_initialization_enables_matching_hint_without_resetting_othe
 
 
 @pytest.mark.asyncio
+async def test_workspace_options_are_applied_in_the_account_transaction(monkeypatch):
+    session = Session([0, 0, 0, 0, False])
+    monkeypatch.setattr(initial, "AsyncSessionLocal", lambda: session)
+    monkeypatch.setattr(initial, "hash_password", lambda _: "hash")
+
+    async def configure(current_session, org, **options):
+        assert current_session is session
+        assert isinstance(org, MSSPOrg) and org in session.added
+        assert not session.committed
+        assert options == {"mode": "single", "sample_data_enabled": True, "initializing": True}
+        raise RuntimeError("fixture failed")
+
+    monkeypatch.setattr(initial, "configure", configure)
+    with pytest.raises(RuntimeError, match="fixture failed"):
+        await initial.initialize_admins(deployment_mode="single", sample_data="sample")
+    assert not session.committed
+
+
+@pytest.mark.asyncio
 async def test_status_only_reports_empty_without_password_generation_or_mutation(monkeypatch):
     session = Session([0, 0, 0, 0, False])
     monkeypatch.setattr(initial, "AsyncSessionLocal", lambda: session)

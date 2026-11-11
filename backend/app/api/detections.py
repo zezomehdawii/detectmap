@@ -25,6 +25,7 @@ from app.models.customer import (
     DetectionTechnique,
     SigmaLevel,
 )
+from app.models.public import Role
 from app.services.detection_review import (
     DEPLOYMENT_APPROVAL_REQUIRED,
     DEPLOYMENT_EDIT_REVIEW_REQUIRED,
@@ -956,12 +957,19 @@ async def suggestions(
     """
     from app.services.cross_promotion import find_suggestions
 
-    if principal.user.mssp_org_id is None or principal.customer is None:
+    if (
+        principal.user.role == Role.CUSTOMER_USER
+        or principal.user.mssp_org_id is None
+        or principal.customer is None
+        or principal.deployment.mode == "single"
+    ):
         return []
     out = await find_suggestions(
         mssp_org_id=str(principal.user.mssp_org_id),
         active_codename=principal.customer.codename,
         active_sector=principal.customer.sector,
+        scope=principal.deployment,
+        sample_workspace=principal.customer.sample_dataset is not None,
     )
     return [PromotionOut(**s.__dict__) for s in out]
 
@@ -1068,14 +1076,17 @@ async def promote_suggestion(
     """
     from app.services.cross_promotion import promote_to_active
 
-    if principal.user.mssp_org_id is None or principal.customer is None:
+    if principal.user.role == Role.CUSTOMER_USER or principal.user.mssp_org_id is None or principal.customer is None:
         raise HTTPException(403, "promotion requires an active MSSP tenant context")
+    if principal.deployment.mode == "single":
+        raise HTTPException(403, "Rule promotion is available in multi-tenant mode.")
     try:
         out = await promote_to_active(
             mssp_org_id=str(principal.user.mssp_org_id),
             source_codename=payload.source_codename,
             source_detection_id=payload.source_detection_id,
             target_codename=principal.customer.codename,
+            scope=principal.deployment,
         )
     except ValueError as e:
         msg = str(e)

@@ -9,7 +9,7 @@ from __future__ import annotations
 import enum
 import uuid
 from datetime import datetime
-from typing import Optional
+from typing import Literal, Optional
 
 from sqlalchemy import (
     Boolean,
@@ -42,12 +42,19 @@ class CustomerStatus(str, enum.Enum):
     ARCHIVED = "archived"
 
 
+DeploymentMode = Literal["single", "multi_tenant"]
+
+
 class MSSPOrg(PublicBase):
     __tablename__ = "mssp_orgs"
 
     id: Mapped[uuid.UUID] = uuid_pk()
     name: Mapped[str] = mapped_column(String(200), nullable=False, unique=True)
     branding: Mapped[dict] = mapped_column(JSONB, default=dict, nullable=False)
+    deployment_mode: Mapped[str] = mapped_column(String(20), server_default="multi_tenant", nullable=False)
+    sample_data_enabled: Mapped[bool] = mapped_column(Boolean, server_default="false", nullable=False)
+    single_customer: Mapped[Optional[str]] = mapped_column(String(32))
+    single_real_customer: Mapped[Optional[str]] = mapped_column(String(32))
     # AI authoring config — Fernet-encrypted key, never returned to the client.
     ai_provider: Mapped[str] = mapped_column(String(20), default="anthropic", nullable=False)
     ai_api_key_encrypted: Mapped[Optional[str]] = mapped_column(Text)
@@ -120,6 +127,7 @@ class Customer(PublicBase):
         nullable=False,
     )
     branding: Mapped[dict] = mapped_column(JSONB, default=dict, nullable=False)
+    sample_dataset: Mapped[Optional[str]] = mapped_column(String(20))
     # Per-customer feature toggles. The allow-list of keys + default values
     # lives in `app/services/customer_features.py`; this column just holds
     # whatever the MSSP admin has overridden. Effective state is the merge

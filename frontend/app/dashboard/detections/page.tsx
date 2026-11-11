@@ -38,6 +38,7 @@ import {
   patchDetection,
 } from '@/lib/api';
 import { FeatureGate, useFeatures } from '@/lib/features';
+import { useDeployment } from '@/lib/deployment';
 import { useUserPrefs } from '@/lib/preferences';
 
 const STATUS_OPTIONS = [
@@ -221,6 +222,7 @@ const LEVEL_COLORS: Record<string, string> = {
 };
 
 export default function DetectionsPage() {
+  const singleEnvironment = useDeployment()?.mode === 'single';
   const searchParams = useSearchParams();
   const { isEnabled } = useFeatures();
   const canEdit = isEnabled('detection_editing');
@@ -383,9 +385,11 @@ export default function DetectionsPage() {
         </Typography>
       </Box>
 
-      <FeatureGate feature="detection_promotion">
-        <SuggestionsStrip />
-      </FeatureGate>
+      {!singleEnvironment && (
+        <FeatureGate feature="detection_promotion">
+          <SuggestionsStrip />
+        </FeatureGate>
+      )}
 
       <Card>
         <CardContent>
