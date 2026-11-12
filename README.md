@@ -33,8 +33,8 @@ sits on top of them.
 | **Reports** | Branded executive PDF (with D3FEND defenses table), ATT&CK Navigator layer JSON, Sigma rule pack export, JSON / CSV / XLSX. |
 | **Connectors** | Splunk / Sentinel / Elastic CRUD; Fernet-encrypted secrets; live read-only ping per connector kind; ingest of *deployed* use-cases for posture verification. |
 | **Settings** | AI authoring config, scheduled-refresh toggles (with run history), product branding, MSSP-portal user management, per-customer feature toggles, per-customer user management. |
-| **Collection management** | Requirements, collection plans, implemented-source links, validation notes, retention and data-quality inventory, ATT&CK visibility, JSON/CSV submissions, and tenant-pinned student access at `/portal/cmf`. See [CMF classroom setup](docs/CMF_CLASSROOM.md). |
-| **Customer profile** | Per-tenant assets (with criticality + compliance scope), asset↔detection linkage (search-and-multi-select picker), network/topology diagrams (image / PDF inline preview · binary download), emergency contacts. The student portal at `/portal/organization` supports manual asset registration for users with asset-write permission. |
+| **Collection management** | Requirements, collection plans, links to implemented sources, validation notes, retention, data quality, ATT&CK visibility, and JSON/CSV exports. Available in the dashboard and customer portal. |
+| **Customer profile** | Per-tenant assets (with criticality + compliance scope), asset↔detection linkage (search-and-multi-select picker), network/topology diagrams (image / PDF inline preview · binary download), emergency contacts. The customer portal at `/portal/organization` supports manual asset registration for users with asset-write permission. |
 | **Asset discovery** | Preview endpoints from an uploaded PCAP or PCAPNG, then add selected assets to the active workspace. |
 | **Network coverage** | Register IPv4 and IPv6 subnets, assign collection sources and detection rules, and review CMF validation, SIEM deployment evidence, and asset visibility by subnet. |
 
@@ -91,7 +91,7 @@ The configuration prompts provide suggested values; press **Enter** to accept:
 2. **Transport:** HTTP, HTTPS with a generated certificate, or HTTPS with your certificate.
 3. **Listen port:** HTTP defaults to **8080**, HTTPS to **8443**. The chosen port drives the actual frontend/proxy mapping.
 4. **Administrator identities:** `admin@demo.local` for the dashboard and `super@detectmap.local` for product administration. A custom dashboard email is also written to the sign-in hint configuration.
-5. **Single environment** is the default and opens one workspace automatically. Choose **Multi-tenant** for separate customer, site, or classroom workspaces.
+5. **Single environment** is the default and opens one workspace automatically. Choose **Multi-tenant** for separate customer or site workspaces.
 6. **Start fresh** is the default and skips the sample records. Choose **Add sample data** to explore the Acme and Globex examples. A single-environment setup with samples opens a sample workspace first.
 
 Setup builds and starts the stack and waits for the API. It asks for the
@@ -356,7 +356,7 @@ Outcome persisted to `connectors.last_test_*`.
 
 ### Customer profile
 
-The customer drawer on the MSSP dashboard manages the per-tenant profile. In the student portal at `/portal/organization`, users with asset-write permission can select **Add asset** to register a device and check its primary IP and location in the inventory.
+The customer drawer on the MSSP dashboard manages the per-tenant profile. In the customer portal at `/portal/organization`, users with asset-write permission can select **Add asset** to register a device and check its primary IP and location in the inventory.
 
 - **Assets** — kind, environment, criticality (low/medium/high/critical, with a critical-count chip), business function, owner, compliance scope (PCI · HIPAA · SOX · GDPR · ISO 27001 · NIST CSF · NIST 800-53 · NCA ECC / CSCC / CCC-CSP / CCC-CST / OTCC), tags, free notes. Coverage rollup per asset (linked rules · deployed rules · techniques covered) computed at read time from the asset↔detection linkage.
 - **Asset ↔ detection linkage** — search-and-multi-select picker over the tenant's full Sigma catalog with debounced title search and status/source filters; wholesale-replace save.
@@ -467,29 +467,12 @@ as disabled options in **Discover assets**.
 
 Assignments record scope in Detect Map. The view uses CMF records and imported SIEM snapshots to report coverage. Checking current traffic ingestion, full subnet visibility, or rule matches for particular addresses requires testing in the monitoring platform. Review the retained assignments after editing a subnet's CIDR.
 
-## CMF classroom and student portal
+## Access collection management
 
-Use [the classroom setup guide](docs/CMF_CLASSROOM.md) for tenant migration,
-dedicated student accounts, synthetic ICS starter data, source validation,
-JSON/CSV submissions, and scoped starter restoration.
-
-MSSP users work at `/dashboard/cmf`. Students sign in using a `customer_user`
-account assigned to one customer and open `/portal/cmf`. Use **Multi-tenant**
-mode to run separate student workspaces. Create these users
-under **Customers → select customer → Users**. Each student/team should have
-its own customer so its collection inventory and plan remain separate.
-
-Existing tenants need migration `0013_cmf_validation_fields`. The standard
-Compose backend applies it at startup. The guide also includes an explicit
-upgrade command that preserves the current inventory and accounts.
-
-CMF integration tests in `tests/test_cmf_classroom_integration.py` run only
-against the explicitly isolated `localhost:15432/cmf_test` database. They
-skip elsewhere. Pure submission/starter-data tests can run with:
-
-```bash
-docker compose exec backend pytest --confcutdir=tests/cmf_unit tests/cmf_unit -q
-```
+MSSP users select a workspace in the dashboard and open **Collection management**
+at `/dashboard/cmf`. Users with the `customer_user` role open
+**Collection management** at `/portal/cmf` for their assigned workspace. Manage
+customer accounts under **Customers → select customer → Users**.
 
 ---
 
