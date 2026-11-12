@@ -22,6 +22,7 @@ from app.api import detections as detections_router
 from app.api import diagrams as diagrams_router
 from app.api import gaps as gaps_router
 from app.api import grc as grc_router
+from app.api import networks as networks_router
 from app.api import portfolio as portfolio_router
 from app.api import posture as posture_router
 from app.api import reports as reports_router
@@ -102,6 +103,7 @@ app.include_router(search_router.router)
 app.include_router(saved_views_router.router)
 app.include_router(roles_router.router)
 app.include_router(assets_router.router)
+app.include_router(networks_router.router)
 app.include_router(cmf_router.router)
 app.include_router(cmf_io_router.router)
 app.include_router(cmf_plan_router.router)

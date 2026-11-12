@@ -76,6 +76,7 @@ const _cachingAdapter: AxiosAdapter = async (config) => {
   const cacheable =
     method === 'get' &&
     !config.responseType && // skip blob / stream downloads
+    !(url.startsWith('/networks/') && url.endsWith('/coverage')) && // read current connector evidence
     !url.includes('/refresh/'); // skip task-status polling
 
   if (!cacheable) {
@@ -487,6 +488,125 @@ export async function updateAsset(
 
 export async function deleteAsset(id: string, customer?: string): Promise<void> {
   await api.delete(`/assets/${id}`, _cust(customer));
+}
+
+export interface NetworkInput {
+  name: string;
+  cidr: string;
+  location: string | null;
+  description: string | null;
+}
+
+export interface NetworkOut extends NetworkInput {
+  id: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface NetworkSourceOption {
+  id: string;
+  name: string;
+  asset_id: string;
+  asset_name: string;
+  enabled: boolean;
+}
+
+export interface NetworkSourceEvidence extends NetworkSourceOption {
+  asset_status: string;
+  validated_at: string | null;
+  connector_id: string | null;
+  connector_label: string | null;
+  storage_location: string | null;
+}
+
+export interface NetworkRuleDeployment {
+  id: string;
+  name: string;
+  connector_id: string | null;
+  connector_label: string | null;
+  enabled: boolean;
+  import_source: string;
+  synced_at: string | null;
+  confirmed_at: string | null;
+  source_ids: string[];
+  validated_source_ids: string[];
+}
+
+export interface NetworkRuleEvidence {
+  id: string;
+  title: string;
+  status: string;
+  evidence_status: 'mapped' | 'enabled_without_source' | 'enabled_with_source' | 'enabled_with_validated_source' | null;
+  deployments: NetworkRuleDeployment[];
+}
+
+export interface NetworkAssetEvidence {
+  id: string;
+  name: string;
+  kind: string;
+  ip_address: string;
+  status: string;
+  data_sources: NetworkSourceEvidence[];
+  rules: NetworkRuleEvidence[];
+}
+
+export interface NetworkCoverage {
+  monitoring_status: 'no_sources' | 'configured' | 'partially_validated' | 'validated';
+  detection_status: 'no_rules' | 'mapped' | 'partially_supported' | 'supported' | null;
+  detection_evidence_available: boolean;
+  connector_evidence_available: boolean;
+  data_sources: NetworkSourceEvidence[];
+  rules: NetworkRuleEvidence[];
+  assets: NetworkAssetEvidence[];
+  asset_monitoring_status: 'no_assets' | 'no_sources' | 'configured' | 'partial' | 'validated';
+  monitored_asset_count: number;
+  validated_asset_count: number;
+}
+
+export type NetworkAssignment = 'data-sources' | 'detections';
+
+export async function listNetworks(customer: string): Promise<NetworkOut[]> {
+  const { data } = await api.get<NetworkOut[]>('/networks', _cust(customer));
+  return data;
+}
+
+export async function saveNetwork(payload: NetworkInput, customer: string, id?: string): Promise<NetworkOut> {
+  const { data } = id
+    ? await api.patch<NetworkOut>(`/networks/${id}`, payload, _cust(customer))
+    : await api.post<NetworkOut>('/networks', payload, _cust(customer));
+  return data;
+}
+
+export async function deleteNetwork(id: string, customer: string): Promise<void> {
+  await api.delete(`/networks/${id}`, _cust(customer));
+}
+
+export async function getNetworkCoverage(id: string, customer: string): Promise<NetworkCoverage> {
+  const { data } = await api.get<NetworkCoverage>(`/networks/${id}/coverage`, _cust(customer));
+  return data;
+}
+
+export async function listNetworkSourceOptions(q: string, offset: number, limit: number, customer: string): Promise<NetworkSourceOption[]> {
+  const { data } = await api.get<NetworkSourceOption[]>('/networks/data-source-options', {
+    ..._cust(customer),
+    params: { q, offset, limit },
+  });
+  return data;
+}
+
+export async function setNetworkAssignment(
+  networkId: string,
+  kind: NetworkAssignment,
+  targetId: string,
+  assigned: boolean,
+  customer: string,
+): Promise<void> {
+  const url = `/networks/${networkId}/${kind}/${targetId}`;
+  if (assigned) {
+    await api.put(url, undefined, _cust(customer));
+  } else {
+    await api.delete(url, _cust(customer));
+  }
 }
 
 export async function listAssetDetections(

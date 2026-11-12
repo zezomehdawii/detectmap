@@ -34,6 +34,7 @@ import RuleRoundedIcon from '@mui/icons-material/RuleRounded';
 import LibraryBooksRoundedIcon from '@mui/icons-material/LibraryBooksRounded';
 import DownloadRoundedIcon from '@mui/icons-material/DownloadRounded';
 import HubRoundedIcon from '@mui/icons-material/HubRounded';
+import LanRoundedIcon from '@mui/icons-material/LanRounded';
 import AccountCircleRoundedIcon from '@mui/icons-material/AccountCircleRounded';
 import BusinessRoundedIcon from '@mui/icons-material/BusinessRounded';
 import LogoutRoundedIcon from '@mui/icons-material/LogoutRounded';
@@ -61,6 +62,7 @@ const PORTAL_NAV: NavGroup[] = [
     items: [
       { label: 'Overview', href: '/portal', icon: <GridViewRoundedIcon fontSize="small" /> },
       { label: 'Collection management', href: '/portal/cmf', icon: <LibraryBooksRoundedIcon fontSize="small" /> },
+      { label: 'Networks', href: '/portal/networks', icon: <LanRoundedIcon fontSize="small" /> },
       { label: 'Coverage Matrix', href: '/portal/coverage', icon: <GridOnRoundedIcon fontSize="small" /> },
       { label: 'APT Coverage', href: '/portal/apt', icon: <GroupsRoundedIcon fontSize="small" /> },
       { label: 'Gap Analysis', href: '/portal/gaps', icon: <ReportProblemRoundedIcon fontSize="small" /> },

@@ -706,6 +706,54 @@ class AssetDataSource(CustomerBase):
     )
 
 
+class Network(CustomerBase):
+    """A registered IPv4 or IPv6 network in the active tenant."""
+
+    __tablename__ = "networks"
+    __table_args__ = (UniqueConstraint("cidr", name="uq_networks_cidr"),)
+
+    id: Mapped[uuid.UUID] = uuid_pk()
+    name: Mapped[str] = mapped_column(String(200), nullable=False)
+    cidr: Mapped[str] = mapped_column(String(64), nullable=False)
+    description: Mapped[Optional[str]] = mapped_column(Text)
+    location: Mapped[Optional[str]] = mapped_column(String(200))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+
+class NetworkDataSource(CustomerBase):
+    """An existing collection source explicitly scoped to a network."""
+
+    __tablename__ = "network_data_sources"
+
+    network_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("networks.id", ondelete="CASCADE"), primary_key=True
+    )
+    asset_data_source_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("asset_data_sources.id", ondelete="CASCADE"), primary_key=True, index=True
+    )
+
+
+class NetworkDetection(CustomerBase):
+    """An existing detection rule explicitly scoped to a network."""
+
+    __tablename__ = "network_detections"
+
+    network_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("networks.id", ondelete="CASCADE"), primary_key=True
+    )
+    detection_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("detections.id", ondelete="CASCADE"), primary_key=True, index=True
+    )
+
+
 class CustomerContact(CustomerBase):
     """Emergency contact for the customer (security ops, exec sponsor,
     on-call rotation, …). Surfaced in the customer profile."""

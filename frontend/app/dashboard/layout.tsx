@@ -46,6 +46,7 @@ import RuleRoundedIcon from '@mui/icons-material/RuleRounded';
 import LibraryBooksRoundedIcon from '@mui/icons-material/LibraryBooksRounded';
 import DownloadRoundedIcon from '@mui/icons-material/DownloadRounded';
 import HubRoundedIcon from '@mui/icons-material/HubRounded';
+import LanRoundedIcon from '@mui/icons-material/LanRounded';
 import BusinessCenterRoundedIcon from '@mui/icons-material/BusinessCenterRounded';
 import StorefrontRoundedIcon from '@mui/icons-material/StorefrontRounded';
 import SettingsRoundedIcon from '@mui/icons-material/SettingsRounded';
@@ -105,6 +106,7 @@ const NAV: NavGroup[] = [
       { label: 'APT Coverage', href: '/dashboard/apt', icon: <GroupsRoundedIcon fontSize="small" /> },
       { label: 'Gap Analysis', href: '/dashboard/gaps', icon: <ReportProblemRoundedIcon fontSize="small" /> },
       { label: 'Collection (CMF)', href: '/dashboard/cmf', icon: <StorageRoundedIcon fontSize="small" /> },
+      { label: 'Networks', href: '/dashboard/networks', icon: <LanRoundedIcon fontSize="small" /> },
       { label: 'Posture', href: '/dashboard/posture', icon: <ShieldRoundedIcon fontSize="small" /> },
       { label: 'Snapshot diff', href: '/dashboard/posture/diff', icon: <ShieldRoundedIcon fontSize="small" /> },
     ],

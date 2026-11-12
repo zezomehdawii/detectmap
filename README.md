@@ -36,6 +36,7 @@ sits on top of them.
 | **Collection management** | Requirements, collection plans, implemented-source links, validation notes, retention and data-quality inventory, ATT&CK visibility, JSON/CSV submissions, and tenant-pinned student access at `/portal/cmf`. See [CMF classroom setup](docs/CMF_CLASSROOM.md). |
 | **Customer profile** | Per-tenant assets (with criticality + compliance scope), asset↔detection linkage (search-and-multi-select picker), network/topology diagrams (image / PDF inline preview · binary download), emergency contacts. The student portal at `/portal/organization` supports manual asset registration for users with asset-write permission. |
 | **Asset discovery** | Preview endpoints from an uploaded PCAP or PCAPNG, then add selected assets to the active workspace. |
+| **Network coverage** | Register IPv4 and IPv6 subnets, assign collection sources and detection rules, and review CMF validation, SIEM deployment evidence, and asset visibility by subnet. |
 
 ---
 
@@ -450,6 +451,15 @@ asset records are added.
 **Planned discovery methods:** start a live capture on the current machine to
 observe assets, or sweep the network to discover them actively. Both appear
 as disabled options in **Discover assets**.
+
+## Review network coverage
+
+1. Select your workspace and open **Networks** in the dashboard or customer portal.
+2. Select **Register network** and enter a name and CIDR, such as `192.0.2.0/24` or `2001:db8::/64`. Location and description are optional. Assets appear automatically when their primary IP falls in the subnet.
+3. Select **Assign collection source** and choose an existing CMF source. A source can belong to a sensor outside the subnet. The view shows which assigned sources are active and which have a CMF validation record.
+4. Select **Assign detection rule** and choose an existing Detection Library rule. To establish deployment evidence, import the SIEM rule under **Connectors → Deployed use-cases**, then confirm the match in **Verified Coverage**. The network view shows the imported enabled state and assigned sources that share the same connector.
+
+Assignments record scope in Detect Map. The view uses CMF records and imported SIEM snapshots to report coverage. Checking current traffic ingestion, full subnet visibility, or rule matches for particular addresses requires testing in the monitoring platform. Review the retained assignments after editing a subnet's CIDR.
 
 ## CMF classroom and student portal
 

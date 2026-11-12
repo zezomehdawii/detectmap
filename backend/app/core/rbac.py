@@ -30,7 +30,7 @@ class Permission(str, enum.Enum):
     CONNECTOR_READ = "connector:read"
     CONNECTOR_WRITE = "connector:write"
 
-    # Customer profile (assets, contacts, network diagrams)
+    # Customer profile (assets, networks, contacts, diagrams)
     ASSET_READ = "asset:read"
     ASSET_WRITE = "asset:write"
 
@@ -166,13 +166,13 @@ PERMISSION_METADATA: dict[Permission, dict[str, str]] = {
     },
     Permission.ASSET_READ: {
         "category": "Customer profile",
-        "label": "Read assets & contacts",
-        "description": "View the customer's asset inventory, network diagrams, and emergency contacts.",
+        "label": "Read assets, networks & contacts",
+        "description": "View the customer's asset and network inventory, diagrams, and emergency contacts.",
     },
     Permission.ASSET_WRITE: {
         "category": "Customer profile",
-        "label": "Edit assets & contacts",
-        "description": "Create/edit/delete assets, link detections to assets, upload network diagrams, manage emergency contacts.",
+        "label": "Edit assets, networks & contacts",
+        "description": "Manage assets, networks, evidence links, diagrams, and emergency contacts.",
     },
     Permission.CATALOG_MANAGE: {
         "category": "Platform",
