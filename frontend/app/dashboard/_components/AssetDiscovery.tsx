@@ -32,16 +32,37 @@ import {
   fetchMe,
   importCaptureAssets,
   previewCaptureAssets,
+  type CaptureEndpoint,
   type CaptureImportResult,
   type CaptureImportRow,
   type CapturePreview,
 } from '@/lib/api';
+import { AssetFields, assetFormPayload, assetFormValues, type AssetFormValues } from './AssetEditor';
 
 const PAGE_SIZE = 15;
 const IMPORT_LIMIT = 500;
 const MAX_CAPTURE_BYTES = 128 * 1024 * 1024;
-type AssetKind = (typeof ASSET_KINDS)[number];
-type Draft = { name: string; kind: AssetKind };
+
+function captureDraft(endpoint: CaptureEndpoint): AssetFormValues {
+  const notes = [
+    `Observed in ${endpoint.packet_count.toLocaleString()} ${endpoint.packet_count === 1 ? 'packet' : 'packets'}.`,
+    endpoint.mac_addresses.length > 0 &&
+      `Observed MACs (may include a next hop): ${endpoint.mac_addresses.join(', ')}.`,
+    endpoint.protocols.length > 0 &&
+      `Protocol hints: ${endpoint.protocols.join(', ')}.`,
+    endpoint.suggested_hostname &&
+      `Hostname observed: ${endpoint.suggested_hostname} (${endpoint.hostname_candidates[0].sources.join(', ')}).`,
+  ].filter(Boolean).join('\n');
+  return assetFormValues({
+    name: endpoint.suggested_name,
+    kind: endpoint.suggested_kind,
+    hostname: endpoint.suggested_hostname,
+    ip_address: endpoint.ip_address,
+    os: endpoint.suggested_os,
+    status: 'planned',
+    notes,
+  });
+}
 
 export default function AssetDiscovery({
   customer,
@@ -101,7 +122,8 @@ function DiscoveryDialog({
   const fileInput = useRef<HTMLInputElement>(null);
   const [file, setFile] = useState<File | null>(null);
   const [preview, setPreview] = useState<CapturePreview | null>(null);
-  const [drafts, setDrafts] = useState<Record<string, Draft>>({});
+  const [drafts, setDrafts] = useState<Record<string, AssetFormValues>>({});
+  const [details, setDetails] = useState<CaptureEndpoint | null>(null);
   const [selection, setSelection] = useState<Set<string>>(new Set());
   const [query, setQuery] = useState('');
   const [page, setPage] = useState(0);
@@ -125,7 +147,7 @@ function DiscoveryDialog({
     try {
       const data = await previewCaptureAssets(file, customer);
       setDrafts(Object.fromEntries(data.endpoints.map((item) => [
-        item.ip_address, { name: item.suggested_name, kind: item.suggested_kind },
+        item.ip_address, captureDraft(item),
       ])));
       setPreview(data);
     } catch (err) {
@@ -137,7 +159,8 @@ function DiscoveryDialog({
 
   const search = query.trim().toLowerCase();
   const filtered = (preview?.endpoints ?? []).filter((item) =>
-    [item.ip_address, drafts[item.ip_address]?.name ?? '', ...item.mac_addresses, ...item.protocols]
+    [item.ip_address, drafts[item.ip_address]?.name ?? '', drafts[item.ip_address]?.hostname ?? '',
+      ...item.hostname_candidates.map((candidate) => candidate.hostname), ...item.mac_addresses, ...item.protocols]
       .some((value) => value.toLowerCase().includes(search)),
   );
   const shown = filtered.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE);
@@ -145,9 +168,9 @@ function DiscoveryDialog({
   const visibleSelected = visibleChoices.filter((item) => selection.has(item.ip_address)).length;
   const allVisibleSelected = visibleChoices.length > 0 && visibleSelected === visibleChoices.length;
   const rows: CaptureImportRow[] = Array.from(selection, (ip_address) => ({
+    ...assetFormPayload(drafts[ip_address]),
     ip_address,
-    name: drafts[ip_address].name.trim(),
-    kind: drafts[ip_address].kind,
+    external_id: drafts[ip_address].externalId.trim() || null,
   }));
   const namesMissing = rows.some((row) => !row.name);
 
@@ -162,7 +185,7 @@ function DiscoveryDialog({
     });
   }
 
-  function updateDraft(address: string, patch: Partial<Draft>) {
+  function updateDraft(address: string, patch: Partial<AssetFormValues>) {
     setDrafts((current) => ({ ...current, [address]: { ...current[address], ...patch } }));
   }
 
@@ -250,9 +273,8 @@ function DiscoveryDialog({
                 {preview.endpoints.length.toLocaleString()} endpoint candidates
               </Typography>
               <Alert severity="info">
-                Confirm candidates before importing. Captures can include off-network peers and
-                shared or translated IPs. A MAC can belong to the next hop. Treat port-based
-                protocol labels as hints about traffic.
+                Review detected names and use Edit details to fill in missing fields. Select only assets
+                you recognize. Captures can include remote peers, shared IPs, and gateway MACs.
               </Alert>
               {(preview.truncated || preview.warnings.length > 0) && (
                 <Alert severity="warning">
@@ -272,7 +294,7 @@ function DiscoveryDialog({
                     <TextField
                       label="Filter endpoints"
                       size="small"
-                      placeholder="IP, name, MAC or protocol"
+                      placeholder="IP, name, hostname, MAC or protocol"
                       value={query}
                       disabled={Boolean(busy)}
                       onChange={(event) => { setQuery(event.target.value); setPage(0); }}
@@ -302,11 +324,12 @@ function DiscoveryDialog({
                           <TableCell>Observed traffic</TableCell>
                           <TableCell>Asset name</TableCell>
                           <TableCell>Asset type</TableCell>
+                          <TableCell>Details</TableCell>
                         </TableRow>
                       </TableHead>
                       <TableBody>
                         {shown.length === 0 && (
-                          <TableRow><TableCell colSpan={5}>No endpoints match this filter.</TableCell></TableRow>
+                          <TableRow><TableCell colSpan={6}>No endpoints match this filter.</TableCell></TableRow>
                         )}
                         {shown.map((item) => {
                           const address = item.ip_address;
@@ -335,7 +358,7 @@ function DiscoveryDialog({
                                 </Typography>
                               </TableCell>
                               {existing ? (
-                                <TableCell colSpan={2}>
+                                <TableCell colSpan={3}>
                                   <Chip size="small" variant="outlined" label="Already in inventory" />
                                   <Typography variant="caption" display="block" color="text.secondary">
                                     {item.existing_asset_name}
@@ -362,12 +385,26 @@ function DiscoveryDialog({
                                       value={draft.kind}
                                       disabled={Boolean(busy)}
                                       SelectProps={{ inputProps: { 'aria-label': `Asset type for ${address}` } }}
-                                      onChange={(event) => updateDraft(address, { kind: event.target.value as AssetKind })}
+                                      onChange={(event) => updateDraft(address, { kind: event.target.value })}
                                     >
                                       {ASSET_KINDS.map((kind) => (
                                         <MenuItem key={kind} value={kind}>{kind === 'iot_ot' ? 'IoT / OT' : kind.replace('_', ' ')}</MenuItem>
                                       ))}
                                     </TextField>
+                                  </TableCell>
+                                  <TableCell sx={{ minWidth: 140, maxWidth: 210 }}>
+                                    <Typography variant="caption" display="block" sx={{ overflowWrap: 'anywhere' }}>
+                                      {draft.hostname || (item.hostname_candidates.length ? 'Hostname available for review' : 'No hostname observed')}
+                                    </Typography>
+                                    <Button
+                                      size="small"
+                                      sx={{ px: 0 }}
+                                      aria-label={`Edit details for ${address}`}
+                                      disabled={Boolean(busy)}
+                                      onClick={() => setDetails(item)}
+                                    >
+                                      Edit details
+                                    </Button>
                                   </TableCell>
                                 </>
                               )}
@@ -412,6 +449,75 @@ function DiscoveryDialog({
               preview ? 'Import selected' : 'Preview endpoints'}
           </Button>
         )}
+      </DialogActions>
+      {details && (
+        <CaptureDetails
+          endpoint={details}
+          draft={drafts[details.ip_address]}
+          onClose={() => setDetails(null)}
+          onSave={(value) => {
+            updateDraft(details.ip_address, value);
+            setDetails(null);
+          }}
+        />
+      )}
+    </Dialog>
+  );
+}
+
+function CaptureDetails({
+  endpoint, draft, onClose, onSave,
+}: {
+  endpoint: CaptureEndpoint;
+  draft: AssetFormValues;
+  onClose: () => void;
+  onSave: (value: AssetFormValues) => void;
+}) {
+  const [value, setValue] = useState(draft);
+  const tags = assetFormPayload(value).tags;
+  const invalidTags = tags.length > 50 || tags.some((tag) => tag.length > 100);
+  function update(changes: Partial<AssetFormValues>) {
+    setValue((current) => ({ ...current, ...changes }));
+  }
+
+  return (
+    <Dialog open onClose={onClose} maxWidth="md" fullWidth aria-labelledby="capture-details-title">
+      <DialogTitle id="capture-details-title">Asset details for {endpoint.ip_address}</DialogTitle>
+      <DialogContent dividers>
+        <Stack spacing={2} sx={{ pt: 1 }}>
+          {endpoint.hostname_candidates.length > 0 && (
+            <Box>
+              <Typography variant="subtitle2">Observed hostnames</Typography>
+              {endpoint.hostname_candidates.map(({ hostname, sources }) => (
+                <Stack key={hostname} direction="row" alignItems="center" justifyContent="space-between" gap={1}>
+                  <Typography variant="body2" sx={{ overflowWrap: 'anywhere', minWidth: 0 }}>
+                    {hostname} · {sources.join(', ')}
+                  </Typography>
+                  <Button size="small" onClick={() => update({ hostname })} aria-label={`Use hostname ${hostname}`}>Use</Button>
+                </Stack>
+              ))}
+            </Box>
+          )}
+          {endpoint.os_candidates.length > 0 && (
+            <Box>
+              <Typography variant="subtitle2">Observed OS versions</Typography>
+              {endpoint.os_candidates.map((os) => (
+                <Stack key={os} direction="row" alignItems="center" justifyContent="space-between" gap={1}>
+                  <Typography variant="body2">{os}</Typography>
+                  <Button size="small" onClick={() => update({ os })} aria-label={`Use OS ${os}`}>Use</Button>
+                </Stack>
+              ))}
+            </Box>
+          )}
+          {invalidTags && <Alert severity="warning">Enter up to 50 tags of 100 characters or fewer.</Alert>}
+          <AssetFields value={value} onChange={update} capture />
+        </Stack>
+      </DialogContent>
+      <DialogActions>
+        <Button onClick={onClose}>Cancel</Button>
+        <Button variant="contained" disabled={!value.name.trim() || invalidTags} onClick={() => onSave(value)}>
+          Save details
+        </Button>
       </DialogActions>
     </Dialog>
   );

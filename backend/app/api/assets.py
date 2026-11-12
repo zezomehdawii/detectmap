@@ -357,6 +357,16 @@ async def create_asset(
     principal: TenantPrincipal = Depends(require_perm(Permission.ASSET_WRITE)),
     __: TenantPrincipal = Depends(require_active_customer()),
 ) -> AssetOut:
+    compliance = _validate_asset_create(payload)
+    async with tenant_session() as session:
+        asset = _new_asset(payload, compliance, principal.user.email)
+        session.add(asset)
+        await session.flush()
+        coverage = await _coverage_for_assets(session, [asset.id])
+        return _serialise_asset(asset, coverage[asset.id], 0)
+
+
+def _validate_asset_create(payload: AssetCreate) -> list[str]:
     _validate_enum(payload.kind, _ASSET_KINDS, "kind")
     _validate_enum(payload.environment, _ENVIRONMENTS, "environment")
     _validate_enum(payload.criticality, _CRITICALITIES, "criticality")
@@ -368,14 +378,7 @@ async def create_asset(
             f"{sorted(v for v in _DATA_CLASSIFICATIONS if v)}",
         )
     _validate_enum(payload.cmf_category, _CMF_CATEGORIES, "cmf_category")
-    compliance = _validate_compliance(payload.compliance_scope)
-
-    async with tenant_session() as session:
-        asset = _new_asset(payload, compliance, principal.user.email)
-        session.add(asset)
-        await session.flush()
-        coverage = await _coverage_for_assets(session, [asset.id])
-        return _serialise_asset(asset, coverage[asset.id], 0)
+    return _validate_compliance(payload.compliance_scope)
 
 
 def _new_asset(payload: AssetCreate, compliance: list[str], email: str) -> Asset:
@@ -393,6 +396,11 @@ def _new_asset(payload: AssetCreate, compliance: list[str], email: str) -> Asset
 
 # ---- Packet capture discovery --------------------------------------------
 
+class CaptureHostnameOut(BaseModel):
+    hostname: str
+    sources: list[str]
+
+
 class CaptureEndpointOut(BaseModel):
     ip_address: str
     mac_addresses: list[str]
@@ -400,6 +408,10 @@ class CaptureEndpointOut(BaseModel):
     packet_count: int
     suggested_name: str
     suggested_kind: str = "other"
+    suggested_hostname: str | None = None
+    hostname_candidates: list[CaptureHostnameOut]
+    suggested_os: str | None = None
+    os_candidates: list[str]
     existing_asset_id: str | None = None
     existing_asset_name: str | None = None
 
@@ -411,12 +423,16 @@ class CapturePreviewOut(BaseModel):
     endpoints: list[CaptureEndpointOut]
 
 
-class CaptureImportRow(BaseModel):
+class CaptureImportRow(AssetCreate):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
     ip_address: str = Field(max_length=64)
     name: str = Field(min_length=1, max_length=200, pattern=r"^[^\x00]+$")
     kind: str = Field(default="other", max_length=40)
+    status: str = "planned"
+    notes: str | None = Field(default=None, max_length=4000)
+    tags: list[str] = Field(default_factory=list, max_length=50)
+    compliance_scope: list[str] = Field(default_factory=list, max_length=len(_COMPLIANCE_FRAMEWORKS))
 
     @field_validator("ip_address")
     @classmethod
@@ -425,6 +441,20 @@ class CaptureImportRow(BaseModel):
         if not capture_discovery.is_endpoint(address):
             raise ValueError("An observed unicast IP address is required.")
         return str(address)
+
+    @field_validator("hostname", "os", "location", "owner", "business_function", "notes", "external_id")
+    @classmethod
+    def validate_text(cls, value: str | None) -> str | None:
+        if value and "\0" in value:
+            raise ValueError("Asset details must not contain NUL characters.")
+        return value or None
+
+    @field_validator("tags")
+    @classmethod
+    def validate_tags(cls, tags: list[str]) -> list[str]:
+        if any(len(tag) > 100 or "\0" in tag for tag in tags):
+            raise ValueError("Each tag must be at most 100 characters and contain no NUL characters.")
+        return list(dict.fromkeys(tag for tag in tags if tag))
 
 
 class CaptureImportRequest(BaseModel):
@@ -565,12 +595,19 @@ async def preview_asset_capture(
     endpoints = []
     for row in discovered.endpoints:
         asset = existing.get(row.ip_address)
+        names = sorted(row.hostname_candidates.items())
+        hostname = names[0][0] if len(names) == 1 else None
+        os_candidates = sorted(row.os_candidates)
         endpoints.append(CaptureEndpointOut(
             ip_address=row.ip_address,
             mac_addresses=sorted(row.mac_addresses),
             protocols=sorted(row.protocols),
             packet_count=row.packet_count,
-            suggested_name=row.ip_address,
+            suggested_name=hostname if hostname and len(hostname) <= 200 else row.ip_address,
+            suggested_hostname=hostname,
+            hostname_candidates=[CaptureHostnameOut(hostname=name, sources=sorted(sources)) for name, sources in names],
+            suggested_os=os_candidates[0] if len(os_candidates) == 1 else None,
+            os_candidates=os_candidates,
             existing_asset_id=asset[0] if asset else None,
             existing_asset_name=asset[1] if asset else None,
         ))
@@ -590,8 +627,7 @@ async def import_asset_capture(
 ) -> CaptureImportOut:
     if __.customer.status != CustomerStatus.ACTIVE:
         raise HTTPException(409, "Packet capture import requires an active environment.")
-    for row in payload.rows:
-        _validate_enum(row.kind, _ASSET_KINDS, "kind")
+    compliance_scopes = [_validate_asset_create(row) for row in payload.rows]
     created = []
     async with tenant_session() as session:
         # Serialize capture imports for this workspace so repeated or
@@ -602,14 +638,14 @@ async def import_asset_capture(
         )
         addresses = {row.ip_address for row in payload.rows}
         seen = set(await _existing_capture_assets(session, addresses))
-        for row in payload.rows:
+        for row, compliance in zip(payload.rows, compliance_scopes):
             if row.ip_address in seen:
                 continue
-            asset = _new_asset(AssetCreate(
-                name=row.name, kind=row.kind, ip_address=row.ip_address, status="planned",
-                tags=["pcap-discovery"],
-                notes="Added through packet capture discovery. Verify the endpoint identity and role.",
-            ), [], principal.user.email)
+            confirmed = row.model_copy(update={
+                "tags": list(dict.fromkeys([*row.tags, "pcap-discovery"])),
+                "notes": row.notes or "Added through packet capture discovery. Verify the endpoint identity and role.",
+            })
+            asset = _new_asset(confirmed, compliance, principal.user.email)
             session.add(asset)
             created.append(CaptureAssetOut(id=str(asset.id), name=asset.name, ip_address=row.ip_address))
             seen.add(row.ip_address)

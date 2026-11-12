@@ -438,12 +438,18 @@ requests. For a custom launch command, run the public migrations and then
 
 1. Open a workspace's **Collection register** or its customer **Profile** and select **Discover assets**.
 2. Choose an uncompressed `.pcap` or `.pcapng` file up to 128 MiB and select **Preview endpoints**.
-3. Review the IPs and their observed traffic. Select the endpoints that belong in your inventory, edit the name or type as needed, and choose **Import selected**. New assets are marked **Planned**; existing IPs are skipped.
+3. Review the IPs and hostname suggestions. Use **Edit details** to check the hostname evidence, correct a suggestion, or enter missing fields such as OS, asset type, location, and owner. Click **Save details** to keep your changes in the preview.
+4. Select the endpoints you recognize and choose **Import selected**. New assets default to **Planned**, and existing IPs are skipped.
 
 ![Asset discovery preview with a selected controller and a known HMI marked as already in inventory](docs/screenshots/asset-discovery.png)
 
-A capture may show remote peers, shared addresses, or a gateway's MAC address.
-Review the candidates before treating them as assets. Detect Map scans up to
+Detect Map links hostnames to IPs using DNS, mDNS, and LLMNR answers, DHCPv4
+leases, and SMB2 NTLM authentication fields. If the capture contains multiple
+names for an IP, **Edit details** shows the candidates and their sources. SMB2
+NTLM can also expose a reported OS version. The draft notes include observed
+MAC addresses, packet counts, and protocol hints. Captures can contain remote
+peers, shared addresses, and gateway MACs. Confirm the device's identity before
+importing. Detect Map scans up to
 1,000,000 packets and shows up to 500 distinct IPs, with a warning if it
 reaches a limit. The capture is discarded after preview; only selected
 asset records are added.

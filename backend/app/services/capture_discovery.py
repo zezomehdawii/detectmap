@@ -1,4 +1,4 @@
-"""Bounded endpoint discovery from PCAP and PCAPNG link/network headers."""
+"""Bounded endpoint and identity discovery from PCAP and PCAPNG files."""
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -6,11 +6,13 @@ from ipaddress import IPv4Address, IPv6Address, ip_address
 from struct import unpack, unpack_from
 from typing import BinaryIO, Iterator
 
+from app.services.capture_identity import CaptureIdentity
+
 MAX_CAPTURE_BYTES = 128 * 1024 * 1024
 MAX_PACKETS = 1_000_000
 MAX_ENDPOINTS = 500
 _MAX_BLOCKS = 1_200_000
-_HEADER_BYTES = 256
+_INSPECTION_BYTES = 4096
 _PCAP_ORDERS = {
     bytes.fromhex("d4 c3 b2 a1"): "<",
     bytes.fromhex("4d 3c b2 a1"): "<",
@@ -32,7 +34,7 @@ _PORT_LABELS = {
     17: {
         53: "DNS", 67: "DHCP", 68: "DHCP", 123: "NTP", 161: "SNMP",
         546: "DHCPv6", 547: "DHCPv6", 2222: "EtherNet/IP",
-        20000: "DNP3", 44818: "EtherNet/IP", 47808: "BACnet/IP",
+        5353: "mDNS", 5355: "LLMNR", 20000: "DNP3", 44818: "EtherNet/IP", 47808: "BACnet/IP",
     },
 }
 
@@ -51,6 +53,8 @@ class Endpoint:
     mac_addresses: set[str] = field(default_factory=set)
     protocols: set[str] = field(default_factory=set)
     packet_count: int = 0
+    hostname_candidates: dict[str, set[str]] = field(default_factory=dict)
+    os_candidates: set[str] = field(default_factory=set)
 
 
 @dataclass
@@ -94,7 +98,7 @@ def _pcap_frames(stream: BinaryIO, size: int, order: str) -> Iterator[tuple[int,
         _, _, captured, original = unpack(order + "IIII", record)
         if captured > original or captured > size - stream.tell():
             raise CaptureError("PCAP packet length is invalid or truncated.")
-        header = stream.read(min(captured, _HEADER_BYTES))
+        header = stream.read(min(captured, _INSPECTION_BYTES))
         if captured > len(header):
             stream.seek(captured - len(header), 1)
         yield linktype, header
@@ -156,7 +160,7 @@ def _pcapng_frames(stream: BinaryIO, size: int) -> Iterator[tuple[int, bytes]]:
             available = end - 4 - stream.tell()
             if captured > original or padded > available or (block_type == 3 and padded != available):
                 raise CaptureError("PCAPNG captured packet length is invalid or truncated.")
-            yield linktype, stream.read(min(captured, _HEADER_BYTES))
+            yield linktype, stream.read(min(captured, _INSPECTION_BYTES))
         stream.seek(end)
 
 
@@ -206,19 +210,22 @@ def _transport(protocol: int, packet: bytes, offset: int | None) -> set[str]:
     return labels
 
 
-def _ipv6_transport(packet: bytes) -> tuple[int, int | None]:
+def _ipv6_transport(packet: bytes) -> tuple[int, int | None, bool]:
     protocol, offset = packet[6], 40
+    fragmented = False
     for _ in range(8):
         if protocol not in {0, 43, 44, 51, 60}:
-            return protocol, offset
+            return protocol, offset, fragmented
         if len(packet) < offset + 2:
             break
         next_protocol = packet[offset]
         if protocol == 44:
             if len(packet) < offset + 8:
                 break
-            if unpack_from("!H", packet, offset + 2)[0] & 0xFFF8:
-                return next_protocol, None
+            fragment = unpack_from("!H", packet, offset + 2)[0]
+            if fragment & 0xFFF8:
+                return next_protocol, None, True
+            fragmented = bool(fragment & 1)
             size = 8
         elif protocol == 51:
             size = (packet[offset + 1] + 2) * 4
@@ -226,28 +233,38 @@ def _ipv6_transport(packet: bytes) -> tuple[int, int | None]:
             size = (packet[offset + 1] + 1) * 8
         offset += size
         protocol = next_protocol
-    return protocol, None
+    return protocol, None, fragmented
 
 
-def _endpoints(linktype: int, frame: bytes) -> tuple[list[tuple[bytes, bytes | None]], set[str]]:
+def _endpoints(
+    linktype: int, frame: bytes, identity: CaptureIdentity,
+) -> tuple[list[tuple[bytes, bytes | None]], set[str]]:
     protocol, packet, source_mac, destination_mac = _link_header(linktype, frame)
     if protocol == 0x0800 and len(packet) >= 20 and packet[0] >> 4 == 4:
         header_len = (packet[0] & 0x0F) * 4
         total_len = unpack_from("!H", packet, 2)[0]
         if header_len < 20 or total_len < header_len:
             return [], set()
-        fragment = unpack_from("!H", packet, 6)[0] & 0x1FFF
-        labels = {"IPv4"} | _transport(packet[9], packet[:total_len], None if fragment else header_len)
-        peers = [(packet[12:16], source_mac)]
+        fragment = unpack_from("!H", packet, 6)[0]
+        packet = packet[:total_len]
+        transport = packet[9]
+        labels = {"IPv4"} | _transport(transport, packet, None if fragment & 0x1FFF else header_len)
+        source = packet[12:16]
+        peers = [(source, source_mac)]
         if destination_mac != _BROADCAST_MAC:
             peers.append((packet[16:20], destination_mac))
+        if not fragment & 0x3FFF and (client := identity.observe(transport, packet, header_len, source)):
+            peers.append(client)
         return peers, labels
     if protocol == 0x86DD and len(packet) >= 40 and packet[0] >> 4 == 6:
         payload_len = unpack_from("!H", packet, 4)[0]
         packet = packet[:40 + payload_len]
-        transport, offset = _ipv6_transport(packet)
+        transport, offset, fragmented = _ipv6_transport(packet)
         labels = {"IPv6"} | _transport(transport, packet, offset)
-        return [(packet[8:24], source_mac), (packet[24:40], destination_mac)], labels
+        source = packet[8:24]
+        if not fragmented:
+            identity.observe(transport, packet, offset, source)
+        return [(source, source_mac), (packet[24:40], destination_mac)], labels
     if protocol == 0x0806 and len(packet) >= 28 and packet[:6] == b"\x00\x01\x08\x00\x06\x04":
         opcode = unpack_from("!H", packet, 6)[0]
         peers = [(packet[14:18], packet[8:14])] if opcode in {1, 2} else []
@@ -258,7 +275,7 @@ def _endpoints(linktype: int, frame: bytes) -> tuple[list[tuple[bytes, bytes | N
 
 
 def discover(stream: BinaryIO) -> Discovery:
-    """Scan capture headers without retaining payloads or connection metadata."""
+    """Scan headers and selected identity messages without retaining raw packets."""
     stream.seek(0, 2)
     size = stream.tell()
     if size > MAX_CAPTURE_BYTES:
@@ -274,6 +291,7 @@ def discover(stream: BinaryIO) -> Discovery:
         raise CaptureError("Upload an uncompressed PCAP or PCAPNG file.")
 
     endpoints: dict[IPv4Address | IPv6Address, Endpoint] = {}
+    identity = CaptureIdentity()
     known_addresses: dict[bytes, IPv4Address | IPv6Address] = {}
     unsupported: set[int] = set()
     supported_frames = False
@@ -288,7 +306,7 @@ def discover(stream: BinaryIO) -> Discovery:
                 unsupported.add(linktype)
                 continue
             supported_frames = True
-            observations, protocols = _endpoints(linktype, frame)
+            observations, protocols = _endpoints(linktype, frame, identity)
             seen: set[IPv4Address | IPv6Address] = set()
             for raw, mac_bytes in observations:
                 address = known_addresses.get(raw)
@@ -311,6 +329,14 @@ def discover(stream: BinaryIO) -> Discovery:
                     endpoint.mac_addresses.add(mac)
     except _ScanLimit:
         packet_limit = True
+
+    for raw, names in identity.hostnames.items():
+        if endpoint := endpoints.get(canonical_address(raw)):
+            for name, sources in names.items():
+                endpoint.hostname_candidates.setdefault(name, set()).update(sources)
+    for raw, versions in identity.os_versions.items():
+        if endpoint := endpoints.get(canonical_address(raw)):
+            endpoint.os_candidates.update(versions)
 
     if unsupported and not supported_frames:
         raise CaptureError("No packets use a supported capture link type.")

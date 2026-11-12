@@ -384,6 +384,10 @@ export interface CaptureEndpoint {
   packet_count: number;
   suggested_name: string;
   suggested_kind: 'other';
+  suggested_hostname: string | null;
+  hostname_candidates: { hostname: string; sources: string[] }[];
+  suggested_os: string | null;
+  os_candidates: string[];
   existing_asset_id: string | null;
   existing_asset_name: string | null;
 }
@@ -395,7 +399,9 @@ export interface CapturePreview {
   endpoints: CaptureEndpoint[];
 }
 
-export interface CaptureImportRow {
+export interface CaptureImportRow extends Partial<Omit<
+  AssetOut, 'id' | 'created_by_email' | 'updated_by_email' | 'created_at' | 'updated_at' | 'coverage' | 'data_source_count'
+>> {
   ip_address: string;
   name: string;
   kind: string;
