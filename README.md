@@ -34,7 +34,7 @@ sits on top of them.
 | **Connectors** | Splunk / Sentinel / Elastic CRUD; Fernet-encrypted secrets; live read-only ping per connector kind; ingest of *deployed* use-cases for posture verification. |
 | **Settings** | AI authoring config, scheduled-refresh toggles (with run history), product branding, MSSP-portal user management, per-customer feature toggles, per-customer user management. |
 | **Collection management** | Requirements, collection plans, implemented-source links, validation notes, retention and data-quality inventory, ATT&CK visibility, JSON/CSV submissions, and tenant-pinned student access at `/portal/cmf`. See [CMF classroom setup](docs/CMF_CLASSROOM.md). |
-| **Customer profile** | Per-tenant assets (with criticality + compliance scope), asset↔detection linkage (search-and-multi-select picker), network/topology diagrams (image / PDF inline preview · binary download), emergency contacts. Read-only mirror at `/portal/organization` for customer users. |
+| **Customer profile** | Per-tenant assets (with criticality + compliance scope), asset↔detection linkage (search-and-multi-select picker), network/topology diagrams (image / PDF inline preview · binary download), emergency contacts. The student portal at `/portal/organization` supports manual asset registration for users with asset-write permission. |
 | **Asset discovery** | Preview endpoints from an uploaded PCAP or PCAPNG, then add selected assets to the active workspace. |
 
 ---
@@ -355,7 +355,7 @@ Outcome persisted to `connectors.last_test_*`.
 
 ### Customer profile
 
-Per-tenant view (under the customer drawer on the MSSP dashboard, mirrored read-only at `/portal/organization` for customer users):
+The customer drawer on the MSSP dashboard manages the per-tenant profile. In the student portal at `/portal/organization`, users with asset-write permission can select **Add asset** to register a device and check its primary IP and location in the inventory.
 
 - **Assets** — kind, environment, criticality (low/medium/high/critical, with a critical-count chip), business function, owner, compliance scope (PCI · HIPAA · SOX · GDPR · ISO 27001 · NIST CSF · NIST 800-53 · NCA ECC / CSCC / CCC-CSP / CCC-CST / OTCC), tags, free notes. Coverage rollup per asset (linked rules · deployed rules · techniques covered) computed at read time from the asset↔detection linkage.
 - **Asset ↔ detection linkage** — search-and-multi-select picker over the tenant's full Sigma catalog with debounced title search and status/source filters; wholesale-replace save.
@@ -537,7 +537,7 @@ detectmap/
     │   │   ├── coverage/ · detections/ · apt/ · gaps/ · posture/ ·
     │   │   ├── reports/ · grc/ · connectors/ · portfolio/ · settings/
     │   └── portal/             # customer-user surface
-    │       ├── organization/   # read-only profile mirror
+    │       ├── organization/   # customer profile and manual asset registration
     │       └── profile/        # user's own account + password change
     └── lib/
         ├── auth.ts             # token + active customer (localStorage + event bus)

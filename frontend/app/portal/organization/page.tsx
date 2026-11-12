@@ -1,10 +1,7 @@
 'use client';
 
-// Customer-facing read-only mirror of the profile that MSSP staff maintain
-// from /dashboard/customers. Customer users see what's been documented
-// about their org: asset inventory, network diagrams, and emergency
-// contacts. Edits flow through the MSSP (who owns the engagement); the
-// portal exposes no write controls.
+// Customer-facing organization profile. Users with asset-write permission
+// can register assets in their own inventory.
 //
 // API auth: customer_user is hard-pinned to their own customer in the
 // JWT, so calls land on their tenant schema automatically — no need to
@@ -14,6 +11,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   Alert,
   Box,
+  Button,
   Card,
   CardContent,
   Chip,
@@ -31,6 +29,7 @@ import {
   Tooltip,
   Typography,
 } from '@mui/material';
+import AddRoundedIcon from '@mui/icons-material/AddRounded';
 import DownloadRoundedIcon from '@mui/icons-material/DownloadRounded';
 import EmailRoundedIcon from '@mui/icons-material/EmailRounded';
 import ImageRoundedIcon from '@mui/icons-material/ImageRounded';
@@ -53,6 +52,7 @@ import {
   listContacts,
   listDiagrams,
 } from '@/lib/api';
+import AssetEditor from '@/app/dashboard/_components/AssetEditor';
 
 const CRITICALITY_COLOR: Record<string, 'default' | 'success' | 'warning' | 'error'> = {
   low: 'default',
@@ -88,12 +88,11 @@ export default function OrganizationPage() {
               : 'Organization'}
         </Typography>
         <Typography variant="body2" color="text.secondary">
-          Asset inventory, network diagrams, and emergency contacts your
-          MSSP has on file. Changes happen through your account team.
+          Asset inventory, network diagrams, and emergency contacts.
         </Typography>
       </Box>
 
-      <AssetsView />
+      <AssetsView canAddAsset={Boolean(me?.can_write_assets && me.customer_codename)} />
       <Divider />
       <DiagramsView />
       <Divider />
@@ -102,12 +101,13 @@ export default function OrganizationPage() {
   );
 }
 
-// ---- Assets (read-only table) -------------------------------------------
+// ---- Assets -------------------------------------------------------------
 
-function AssetsView() {
+function AssetsView({ canAddAsset }: { canAddAsset: boolean }) {
   const [items, setItems] = useState<AssetOut[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [adding, setAdding] = useState(false);
 
   const reload = useCallback(async () => {
     setLoading(true);
@@ -138,7 +138,7 @@ function AssetsView() {
             Assets ({items.length})
           </Typography>
           <Typography variant="caption" color="text.secondary" sx={{ display: 'block' }}>
-            Systems your MSSP has documented as in scope.
+            Systems recorded for your organization.
           </Typography>
         </Box>
         {criticalCount > 0 && (
@@ -149,6 +149,16 @@ function AssetsView() {
             color="error"
             variant="outlined"
           />
+        )}
+        {canAddAsset && (
+          <Button
+            size="small"
+            variant="contained"
+            startIcon={<AddRoundedIcon />}
+            onClick={() => setAdding(true)}
+          >
+            Add asset
+          </Button>
         )}
       </Stack>
 
@@ -169,6 +179,8 @@ function AssetsView() {
               <TableRow>
                 <TableCell>Name</TableCell>
                 <TableCell>Kind</TableCell>
+                <TableCell>Primary IP</TableCell>
+                <TableCell>Location</TableCell>
                 <TableCell>Criticality</TableCell>
                 <TableCell>Environment</TableCell>
                 <TableCell>Business function</TableCell>
@@ -187,8 +199,10 @@ function AssetsView() {
                     )}
                   </TableCell>
                   <TableCell>
-                    <Chip size="small" label={a.kind} variant="outlined" />
+                    <Chip size="small" label={a.kind.replace('_', ' ')} variant="outlined" />
                   </TableCell>
+                  <TableCell>{a.ip_address ?? '—'}</TableCell>
+                  <TableCell>{a.location ?? '—'}</TableCell>
                   <TableCell>
                     <Chip
                       size="small"
@@ -215,6 +229,16 @@ function AssetsView() {
             </TableBody>
           </Table>
         </TableContainer>
+      )}
+      {canAddAsset && adding && (
+        <AssetEditor
+          target="new"
+          onClose={() => setAdding(false)}
+          onSaved={() => {
+            setAdding(false);
+            void reload();
+          }}
+        />
       )}
     </Box>
   );

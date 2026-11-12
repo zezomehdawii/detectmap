@@ -48,6 +48,7 @@ Reset is an instructor CLI action and has no student-facing endpoint. Export stu
 
 ## Student workflow and submissions
 
+- To register a device manually, open **Organization → Assets → Add asset**. Enter its name, kind, primary IP, and location, then select **Create**. Verify the saved fields in **Assets**. Collection sources are registered separately in the CMF.
 - To discover assets from a supplied training capture, open **Collection register → Discover assets**, choose a PCAP or PCAPNG, and preview the endpoints. Select and import only devices that belong to the lab inventory. An observed IP is a clue; confirm the device role, site, and source capabilities before filling in the collection plan.
 - Enter the source/component mapping, site/asset context, kill-chain phase, follow-on collection, storage location, and retention in the CMF collection register.
 - Link each plan item to its requirement and target asset. Implementation means creating/updating the actual source record and linking it, not just selecting a status.
