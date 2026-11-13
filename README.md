@@ -48,7 +48,7 @@ Install **Git** and **Python 3.10+**, then open a terminal in the folder where
 you want to keep Detect Map. Clone the public repository and enter it:
 
 ```bash
-git clone https://github.com/zezomehdawii/detectmap.git
+git clone https://github.com/ziyad-mehdawii/detectmap.git
 cd detectmap
 ```
 
