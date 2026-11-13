@@ -1,4 +1,4 @@
-"""Workspace selection and managed sample data for each installation's org."""
+"""Tenant visibility and managed sample data for each installation's org."""
 from __future__ import annotations
 
 import uuid
@@ -8,7 +8,8 @@ from sqlalchemy import select, text, true
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.tenant import schema_for
-from app.models.public import Customer, CustomerStatus, DeploymentMode, MSSPOrg
+from app.models.public import Customer, CustomerStatus, MSSPOrg
+from app.services.attack_ingest import ensure_reference_catalog
 from app.services.provisioning import provisioned_customer
 
 
@@ -17,30 +18,18 @@ SAMPLE_DISABLED_FEATURES = {"connector_tests", "grc_editing"}
 
 @dataclass(frozen=True)
 class DeploymentScope:
-    mode: DeploymentMode = "multi_tenant"
     sample_data_enabled: bool = False
-    active_customer: str | None = None
 
     @classmethod
     def from_org(cls, org: MSSPOrg) -> DeploymentScope:
-        return cls(
-            mode=org.deployment_mode,
-            sample_data_enabled=org.sample_data_enabled,
-            active_customer=org.single_customer if org.deployment_mode == "single" else None,
-        )
+        return cls(sample_data_enabled=org.sample_data_enabled)
 
     def customer_filter(self):
         """SQL filter for workspaces available for normal data access."""
-        sample_filter = true() if self.sample_data_enabled else Customer.sample_dataset.is_(None)
-        if self.mode == "single":
-            return sample_filter & (Customer.codename == self.active_customer)
-        return sample_filter
+        return true() if self.sample_data_enabled else Customer.sample_dataset.is_(None)
 
     def permits(self, customer: Customer) -> bool:
-        return (
-            (self.sample_data_enabled or customer.sample_dataset is None)
-            and (self.mode != "single" or customer.codename == self.active_customer)
-        )
+        return self.sample_data_enabled or customer.sample_dataset is None
 
 
 async def get_org(session: AsyncSession, org_id: uuid.UUID | None, *, for_update: bool = False) -> MSSPOrg | None:
@@ -73,6 +62,7 @@ async def codename_available(session: AsyncSession, codename: str) -> bool:
 async def _new_workspace(session: AsyncSession, org: MSSPOrg, dataset: str | None = None) -> Customer:
     from app.scripts.seed_demo import CUSTOMERS
     from app.scripts.seed_dummy_data import BRANDING, seed_tenant_fixtures
+    from app.services.sample_inventory import seed_sample_inventory
 
     customer_id = uuid.uuid4()
     prefix = f"sample_{dataset}" if dataset else "environment"
@@ -88,7 +78,7 @@ async def _new_workspace(session: AsyncSession, org: MSSPOrg, dataset: str | Non
         id=customer_id,
         mssp_org_id=org.id,
         codename=codename,
-        name=f"{spec['name']} (sample)" if spec else "My environment",
+        name=f"{spec['name']} (sample)" if spec else "My workspace",
         sector=spec["sector"] if spec else None,
         status=CustomerStatus.ACTIVE,
         branding=branding,
@@ -97,9 +87,11 @@ async def _new_workspace(session: AsyncSession, org: MSSPOrg, dataset: str | Non
     )
     session.add(customer)
     await session.flush()
-    async with provisioned_customer(session, codename):
+    async with provisioned_customer(session, codename, seed_global_rules=bool(dataset)):
         if dataset:
             await seed_tenant_fixtures(session, dataset, codename, offline=True)
+            await seed_sample_inventory(session, dataset)
+            customer.sample_inventory_seeded = True
     return customer
 
 
@@ -114,50 +106,33 @@ async def configure(
     session: AsyncSession,
     org: MSSPOrg,
     *,
-    mode: DeploymentMode | None = None,
     sample_data_enabled: bool | None = None,
-    primary_customer: str | None = None,
     initializing: bool = False,
 ) -> list[Customer]:
     """Update a locked org and its workspaces in the caller's transaction."""
-    mode = mode or org.deployment_mode
     enabled = org.sample_data_enabled if sample_data_enabled is None else sample_data_enabled
+    if initializing or enabled:
+        await ensure_reference_catalog()
     workspaces = await list_workspaces(session, org.id)
+    if not enabled and not any(
+        customer.status == CustomerStatus.ACTIVE and customer.sample_dataset is None
+        for customer in workspaces
+    ) and (initializing or org.sample_data_enabled):
+        workspaces.append(await _new_workspace(session, org))
+
     if enabled:
         from app.scripts.seed_demo import CUSTOMERS
+        from app.services.sample_inventory import seed_sample_inventory
 
-        present = {customer.sample_dataset for customer in workspaces}
+        samples = {customer.sample_dataset: customer for customer in workspaces if customer.sample_dataset}
         for spec in CUSTOMERS:
-            if spec["codename"] not in present:
-                workspaces.append(await _new_workspace(session, org, spec["codename"]))
-
-    if mode == "single":
-        visible = {
-            customer.codename: customer for customer in workspaces
-            if customer.status == CustomerStatus.ACTIVE and (enabled or customer.sample_dataset is None)
-        }
-        if primary_customer is not None and primary_customer not in visible:
-            raise ValueError("Choose an active environment available for single environment mode.")
-        selected = visible.get(primary_customer or org.single_customer)
-        if selected is None:
-            selected = visible.get(org.single_real_customer)
-        if selected is None and initializing and enabled:
-            selected = next(customer for customer in visible.values() if customer.sample_dataset == "acme")
-        if selected is None:
-            real = [customer for customer in visible.values() if customer.sample_dataset is None]
-            if not real:
-                # Enabling samples later should not put a working install into a
-                # sample workspace without an explicit choice.
-                selected = await _new_workspace(session, org)
-                workspaces.append(selected)
-            elif len(real) == 1 or org.deployment_mode == "single":
-                selected = real[0]
-            else:
-                raise ValueError("Choose the active environment before switching to single environment mode.")
-        org.single_customer = selected.codename
-        if selected.sample_dataset is None:
-            org.single_real_customer = selected.codename
-
-    org.deployment_mode = mode
+            dataset = spec["codename"]
+            sample = samples.get(dataset)
+            if sample is None:
+                workspaces.append(await _new_workspace(session, org, dataset))
+            elif not sample.sample_inventory_seeded:
+                async with provisioned_customer(session, sample.codename):
+                    await seed_sample_inventory(session, dataset)
+                    sample.sample_inventory_seeded = True
     org.sample_data_enabled = enabled
     return workspaces

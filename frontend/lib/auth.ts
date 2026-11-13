@@ -49,15 +49,19 @@ export function clearToken(): void {
 
 export function getActiveCustomer(): string | null {
   if (typeof window === 'undefined') return null;
-  return sessionStorage.getItem(CUSTOMER_KEY);
+  return sessionStorage.getItem(CUSTOMER_KEY) || null;
+}
+
+export function hasCustomerSelection(): boolean {
+  return typeof window !== 'undefined' && sessionStorage.getItem(CUSTOMER_KEY) !== null;
 }
 
 export const ACTIVE_CUSTOMER_EVENT = 'detectmap:active-customer-changed';
 
 export function setActiveCustomer(codename: string | null): void {
   if (typeof window === 'undefined') return;
-  if (codename) sessionStorage.setItem(CUSTOMER_KEY, codename);
-  else sessionStorage.removeItem(CUSTOMER_KEY);
+  // An empty value records an explicit choice of the all-customer portfolio.
+  sessionStorage.setItem(CUSTOMER_KEY, codename ?? '');
   window.dispatchEvent(
     new CustomEvent(ACTIVE_CUSTOMER_EVENT, { detail: codename }),
   );

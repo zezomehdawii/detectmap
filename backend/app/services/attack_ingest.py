@@ -6,13 +6,16 @@ unless `force=True`. Tests inject `fetch_fn` to bypass network round-trips.
 from __future__ import annotations
 
 import asyncio
+import gzip
+import json
 import logging
 import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Awaitable, Callable, Iterable, Optional
 
 import httpx
-from sqlalchemy import Table, delete, select, update
+from sqlalchemy import Table, delete, select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app.config import settings
@@ -33,6 +36,7 @@ from app.services.attack_diff import TechniqueSnapshot, compute_diff
 log = logging.getLogger(__name__)
 
 DOMAINS = ("enterprise", "ics", "mobile")
+_BUNDLED_DATA = Path(__file__).resolve().parents[1] / "data" / "attack"
 
 FetchFn = Callable[[str], Awaitable[dict]]
 
@@ -419,6 +423,7 @@ async def refresh_domain(
     *,
     force: bool = False,
     fetch_fn: Optional[FetchFn] = None,
+    only_if_empty: bool = False,
 ) -> dict:
     """Refresh one ATT&CK domain. Idempotent on `(domain, version)`."""
     if domain not in DOMAINS:
@@ -431,6 +436,15 @@ async def refresh_domain(
 
     async with AsyncSessionLocal() as session:
         async with session.begin():
+            await session.execute(
+                text("SELECT pg_advisory_xact_lock(741225033, hashtext(:domain))"),
+                {"domain": domain},
+            )
+            if only_if_empty and await session.scalar(
+                select(AttackTechnique.id).where(AttackTechnique.domain == domain).limit(1)
+            ):
+                return {"domain": domain, "no_op": True}
+
             # FOR UPDATE so concurrent workers serialize on the version row
             # instead of racing the upsert + relationship reset.
             existing = (
@@ -553,6 +567,20 @@ async def refresh_domain(
             )
 
     return {"domain": domain, "version": version, "no_op": False, **summary}
+
+
+async def ensure_reference_catalog() -> None:
+    """Supply the bundled reference for absent domains and retain existing imports."""
+    async with AsyncSessionLocal() as session:
+        populated = set(await session.scalars(select(AttackTechnique.domain).distinct()))
+
+    async def read_bundle(domain: str) -> dict:
+        with gzip.open(_BUNDLED_DATA / f"{domain}-attack.json.gz", "rt", encoding="utf-8") as source:
+            return json.load(source)
+
+    for domain in DOMAINS:
+        if domain not in populated:
+            await refresh_domain(domain, fetch_fn=read_bundle, only_if_empty=True)
 
 
 async def refresh_all(

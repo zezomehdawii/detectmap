@@ -24,6 +24,11 @@ def login_defaults(monkeypatch):
     ))
 
 
+@pytest.fixture(autouse=True)
+def isolated_workspace_configuration(monkeypatch):
+    monkeypatch.setattr(initial, "configure", AsyncMock())
+
+
 class Transaction:
     def __init__(self, session):
         self.session = session
@@ -135,12 +140,12 @@ async def test_workspace_options_are_applied_in_the_account_transaction(monkeypa
         assert current_session is session
         assert isinstance(org, MSSPOrg) and org in session.added
         assert not session.committed
-        assert options == {"mode": "single", "sample_data_enabled": True, "initializing": True}
+        assert options == {"sample_data_enabled": True, "initializing": True}
         raise RuntimeError("fixture failed")
 
     monkeypatch.setattr(initial, "configure", configure)
     with pytest.raises(RuntimeError, match="fixture failed"):
-        await initial.initialize_admins(deployment_mode="single", sample_data="sample")
+        await initial.initialize_admins(sample_data="sample")
     assert not session.committed
 
 

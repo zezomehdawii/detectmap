@@ -76,7 +76,7 @@ async def _ensure_customer(org_id: uuid.UUID, spec: dict) -> uuid.UUID:
         customer_id = customer.id
 
     print(f"  customer {spec['codename']:<8s} provisioning schema...")
-    await provision_customer(spec["codename"])
+    await provision_customer(spec["codename"], seed_global_rules=True)
 
     async with AsyncSessionLocal() as session:
         customer = (

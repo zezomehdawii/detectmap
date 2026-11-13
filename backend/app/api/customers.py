@@ -102,8 +102,6 @@ async def create_customer(
             org = await deployment.get_org(session, principal.user.mssp_org_id, for_update=True)
             if org is None:
                 raise HTTPException(400, "Caller has no MSSP org")
-            if org.deployment_mode == "single":
-                raise HTTPException(409, "Switch to multi-tenant mode before adding another environment.")
             if not await deployment.codename_available(session, payload.codename):
                 raise HTTPException(409, "Codename already used")
             customer = Customer(
@@ -163,8 +161,6 @@ async def patch_customer(
         customer = await _load_customer_or_404(session, codename, org.id, scope=scope)
 
         if payload.status is not None and payload.status != customer.status:
-            if scope.mode == "single":
-                raise HTTPException(409, "Change the active environment in Settings before changing this status.")
             if customer.sample_dataset is not None:
                 raise HTTPException(409, "Use Environment settings to show or hide sample workspaces.")
             allowed = _ALLOWED_TRANSITIONS.get(customer.status, set())

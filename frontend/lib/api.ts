@@ -205,13 +205,9 @@ export async function fetchMe(customer?: string): Promise<MeResponse> {
   return data;
 }
 
-export type DeploymentMode = 'single' | 'multi_tenant';
-
 export interface DeploymentSettings {
-  mode: DeploymentMode;
   sample_data_enabled: boolean;
-  primary_customer: string | null;
-  active_customer: string | null;
+  initial_customer?: string | null;
   environments: { codename: string; name: string; is_sample: boolean }[];
   can_edit: boolean;
 }
@@ -222,9 +218,7 @@ export async function getDeploymentSettings(): Promise<DeploymentSettings> {
 }
 
 export async function patchDeploymentSettings(payload: {
-  mode?: DeploymentMode;
-  sample_data_enabled?: boolean;
-  primary_customer?: string;
+  sample_data_enabled: boolean;
 }): Promise<DeploymentSettings> {
   const { data } = await api.patch<DeploymentSettings>(ENVIRONMENT_SETTINGS_URL, payload, {
     // Enabling samples can provision the example environments and load their records.

@@ -15,7 +15,7 @@ def arguments(**overrides):
         mssp_name="Test MSSP", admin_email=None, admin_password=None,
         super_email="super@example.local", super_password=None,
         use_login_defaults=True, yes=True,
-        deployment_mode="single", sample_data="sample",
+        sample_data="sample",
     )
     values.update(overrides)
     return argparse.Namespace(**values)
@@ -43,7 +43,7 @@ async def test_opted_in_reset_uses_matching_dashboard_defaults_and_generated_sup
     reset_calls.reset.assert_awaited_once_with(
         mssp_name="Test MSSP", admin_email="admin@demo.local", admin_password="change-me",
         super_email="super@example.local", super_password="super-temporary", use_login_defaults=True,
-        deployment_mode="single", sample_data="sample",
+        sample_data="sample",
     )
     output = capsys.readouterr().out
     assert "Settings -> Branding" in output
@@ -80,7 +80,7 @@ async def test_legacy_reset_still_generates_two_passwords_with_legacy_email(rese
     reset_calls.reset.assert_awaited_once_with(
         mssp_name="Test MSSP", admin_email="admin@detectmap.local", admin_password="admin-temporary",
         super_email="super@example.local", super_password="super-temporary", use_login_defaults=False,
-        deployment_mode="single", sample_data="sample",
+        sample_data="sample",
     )
     assert "Both accounts will be required" in capsys.readouterr().out
 
@@ -98,6 +98,7 @@ async def test_seeded_hint_and_dashboard_rotation_match_selected_mode(monkeypatc
     added = []
     session = SimpleNamespace(add=added.append, flush=AsyncMock(), execute=AsyncMock())
     monkeypatch.setattr(reset, "hash_password", lambda value: "hashed:" + value)
+    monkeypatch.setattr(reset, "configure", AsyncMock())
     await reset._seed_admin(
         session,
         mssp_name="Test", admin_email="admin@example.local", admin_password="dashboard-password",

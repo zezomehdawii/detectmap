@@ -8,7 +8,7 @@ Permission split:
 from __future__ import annotations
 
 import uuid
-from typing import Optional
+from typing import Literal, Optional
 
 from fastapi import APIRouter, Body, Depends, HTTPException
 from pydantic import BaseModel, ConfigDict, Field
@@ -33,7 +33,6 @@ from app.models.public import (
     AuditLog,
     Customer,
     CustomerStatus,
-    DeploymentMode,
     MSSPOrg,
     Role,
     ScheduledJobRun,
@@ -84,10 +83,11 @@ class EnvironmentOption(BaseModel):
 
 
 class EnvironmentSettingsOut(BaseModel):
-    mode: DeploymentMode
+    mode: Literal["multi_tenant"] = "multi_tenant"
     sample_data_enabled: bool
-    primary_customer: str | None
-    active_customer: str | None
+    primary_customer: None = None
+    active_customer: None = None
+    initial_customer: str | None
     environments: list[EnvironmentOption]
     can_edit: bool
 
@@ -95,28 +95,31 @@ class EnvironmentSettingsOut(BaseModel):
 class EnvironmentSettingsPatch(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    mode: DeploymentMode | None = None
+    mode: Literal["multi_tenant"] | None = None
     sample_data_enabled: bool | None = None
-    primary_customer: str | None = Field(default=None, pattern=r"^[a-z][a-z0-9_]{1,30}$")
+    primary_customer: None = None
 
 
 def _environment_out(org: MSSPOrg, workspaces: list[Customer], can_edit: bool) -> EnvironmentSettingsOut:
     scope = deployment.DeploymentScope.from_org(org)
-    options = [
-        EnvironmentOption(codename=customer.codename, name=customer.name, is_sample=customer.sample_dataset is not None)
-        for customer in workspaces
-        if customer.status == CustomerStatus.ACTIVE and (
-            scope.permits(customer)
-            or (can_edit and (scope.sample_data_enabled or customer.sample_dataset is None))
-        )
+    visible = [
+        customer for customer in workspaces
+        if customer.status == CustomerStatus.ACTIVE and scope.permits(customer)
     ]
-    selected = org.single_customer if any(option.codename == org.single_customer for option in options) else None
+    initial_customer = None
+    if len(visible) == 1:
+        initial_customer = visible[0].codename
+    elif all(customer.sample_dataset for customer in visible):
+        initial_customer = next(
+            (customer.codename for customer in visible if customer.sample_dataset == "acme"), None,
+        )
     return EnvironmentSettingsOut(
-        mode=scope.mode,
         sample_data_enabled=scope.sample_data_enabled,
-        primary_customer=selected if can_edit else scope.active_customer,
-        active_customer=scope.active_customer,
-        environments=options,
+        initial_customer=initial_customer,
+        environments=[
+            EnvironmentOption(codename=c.codename, name=c.name, is_sample=c.sample_dataset is not None)
+            for c in visible
+        ],
         can_edit=can_edit,
     )
 
@@ -153,10 +156,7 @@ async def patch_environment_settings(
             org = await deployment.get_org(session, principal.user.mssp_org_id, for_update=True)
             if org is None:
                 raise HTTPException(403, "User has no MSSP org")
-            try:
-                workspaces = await deployment.configure(session, org, **payload.model_dump())
-            except ValueError as exc:
-                raise HTTPException(422, str(exc)) from exc
+            workspaces = await deployment.configure(session, org, sample_data_enabled=payload.sample_data_enabled)
             response = _environment_out(org, workspaces, can_edit=True)
             await _record_audit(
                 session,
@@ -164,7 +164,7 @@ async def patch_environment_settings(
                 actor_kind="user",
                 action="deployment_settings_update",
                 target=str(org.id),
-                detail=f"mode={response.mode}, sample_data={response.sample_data_enabled}, primary={response.primary_customer}",
+                detail=f"sample_data={response.sample_data_enabled}",
             )
         return response
 

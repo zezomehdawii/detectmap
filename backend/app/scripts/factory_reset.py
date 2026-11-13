@@ -76,7 +76,6 @@ from app.models.public import (  # noqa: E402
     AuditLog,
     CustomRole,
     Customer,
-    DeploymentMode,
     MSSPOrg,
     Role,
     ScheduledJobRun,
@@ -150,7 +149,6 @@ async def _seed_admin(
     super_email: str,
     super_password: str,
     use_login_defaults: bool = False,
-    deployment_mode: DeploymentMode = "multi_tenant",
     sample_data: Literal["sample", "fresh"] = "fresh",
 ) -> None:
     org = MSSPOrg(id=uuid.uuid4(), name=mssp_name)
@@ -188,11 +186,7 @@ async def _seed_admin(
             set_={"show_login_hint": use_login_defaults},
         )
     )
-    if deployment_mode != "multi_tenant" or sample_data == "sample":
-        await configure(
-            session, org, mode=deployment_mode, sample_data_enabled=sample_data == "sample",
-            initializing=True,
-        )
+    await configure(session, org, sample_data_enabled=sample_data == "sample", initializing=True)
 
 
 async def _reset_deployment(**admin_options) -> list[str]:
@@ -281,7 +275,6 @@ async def _amain(args: argparse.Namespace) -> int:
         super_email=super_email,
         super_password=super_password,
         use_login_defaults=use_login_defaults,
-        deployment_mode=args.deployment_mode,
         sample_data=args.sample_data,
     )
     print(_dim(f"  dropped {len(schemas)} schema(s): {', '.join(schemas) or '(none)'}"))
@@ -356,7 +349,7 @@ def main() -> None:
         action="store_true",
         help="Skip the typed RESET confirmation (use for unattended setup)",
     )
-    p.add_argument("--deployment-mode", choices=("single", "multi_tenant"), default="multi_tenant")
+    p.add_argument("--deployment-mode", choices=("multi_tenant",), help=argparse.SUPPRESS)
     p.add_argument("--sample-data", choices=("sample", "fresh"), default="fresh")
     args = p.parse_args()
 

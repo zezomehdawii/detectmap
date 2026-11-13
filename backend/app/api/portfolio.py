@@ -72,8 +72,6 @@ async def overview(
             403,
             "User has no MSSP org — only MSSP-scoped users can view portfolio",
         )
-    if principal.deployment.mode == "single":
-        raise HTTPException(403, "Portfolio is available in multi-tenant mode.")
 
     async with AsyncSessionLocal() as session:
         customers = (
@@ -205,8 +203,6 @@ async def compare_customers(
     kind = _parse_kind(denominator)
     if principal.user.mssp_org_id is None:
         raise HTTPException(403, "User has no MSSP org")
-    if principal.deployment.mode == "single":
-        raise HTTPException(403, "Comparison is available in multi-tenant mode.")
 
     codenames = [c.strip() for c in customers.split(",") if c.strip()]
     if not 2 <= len(codenames) <= 6:

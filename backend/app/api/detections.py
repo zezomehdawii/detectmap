@@ -984,7 +984,6 @@ async def suggestions(
         principal.user.role == Role.CUSTOMER_USER
         or principal.user.mssp_org_id is None
         or principal.customer is None
-        or principal.deployment.mode == "single"
     ):
         return []
     out = await find_suggestions(
@@ -1101,8 +1100,6 @@ async def promote_suggestion(
 
     if principal.user.role == Role.CUSTOMER_USER or principal.user.mssp_org_id is None or principal.customer is None:
         raise HTTPException(403, "promotion requires an active MSSP tenant context")
-    if principal.deployment.mode == "single":
-        raise HTTPException(403, "Rule promotion is available in multi-tenant mode.")
     try:
         out = await promote_to_active(
             mssp_org_id=str(principal.user.mssp_org_id),

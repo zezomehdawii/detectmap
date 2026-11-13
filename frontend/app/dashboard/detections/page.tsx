@@ -41,7 +41,6 @@ import {
   patchDetection,
 } from '@/lib/api';
 import { FeatureGate } from '@/lib/features';
-import { useDeployment } from '@/lib/deployment';
 import { useUserPrefs } from '@/lib/preferences';
 import { DetectionDrawerExtras, SuggestionsStrip } from './DetectionExtras';
 import { DetectionReviewPanel } from './ReviewPanel';
@@ -226,7 +225,6 @@ const LEVEL_COLORS: Record<string, string> = {
 };
 
 export default function DetectionsPage() {
-  const singleEnvironment = useDeployment()?.mode === 'single';
   const searchParams = useSearchParams();
   const canEdit = useCanEditDetections();
   const { get: getPref } = useUserPrefs();
@@ -424,11 +422,9 @@ export default function DetectionsPage() {
         </Typography>
       </Box>
 
-      {!singleEnvironment && (
-        <FeatureGate feature="detection_promotion">
-          <SuggestionsStrip />
-        </FeatureGate>
-      )}
+      <FeatureGate feature="detection_promotion">
+        <SuggestionsStrip />
+      </FeatureGate>
 
       <Card>
         <CardContent>

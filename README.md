@@ -3,9 +3,9 @@
 **The Detection Map** — a platform for MITRE ATT&CK–driven detection coverage,
 gap analysis, and threat-informed defense.
 
-Run Detect Map for a single organization or site, or switch to multi-tenant
-mode to manage multiple isolated environments. Analysts can see which Sigma
-rules cover each ATT&CK technique and where gaps remain for a given APT group.
+Detect Map uses isolated tenant workspaces for organizations and sites.
+Analysts can see which Sigma rules cover each ATT&CK technique and where gaps
+remain for a given APT group.
 Outputs include MITRE Navigator–style coverage matrices,
 branded executive PDFs, Sigma rule packs converted to Splunk SPL / Elastic
 Lucene / Sentinel KQL, and GRC crosswalks against NIST CSF, ISO 27001, and
@@ -32,7 +32,7 @@ sits on top of them.
 | **GRC** | NIST CSF · ISO 27001 · NCA ECC / CSCC / CCC-CSP / CCC-CST / OTCC crosswalks; technique→control mapping; D3FEND defensive countermeasures per control; control-coverage view; compliance-evidence exports. |
 | **Reports** | Branded executive PDF (with D3FEND defenses table), ATT&CK Navigator layer JSON, Sigma rule pack export, JSON / CSV / XLSX. |
 | **Connectors** | Splunk / Sentinel / Elastic CRUD; Fernet-encrypted secrets; live read-only ping per connector kind; ingest of *deployed* use-cases for posture verification. |
-| **Settings** | AI authoring config, scheduled-refresh toggles (with run history), product branding, MSSP-portal user management, per-customer feature toggles, per-customer user management. |
+| **Settings** | Sample workspace management, AI authoring config, scheduled-refresh toggles (with run history), product branding, MSSP-portal user management, per-customer feature toggles, per-customer user management. |
 | **Collection management** | Requirements, collection plans, links to implemented sources, validation notes, retention, data quality, ATT&CK visibility, and JSON/CSV exports. Available in the dashboard and customer portal. |
 | **Customer profile** | Per-tenant assets (with criticality + compliance scope), asset↔detection linkage (search-and-multi-select picker), network/topology diagrams (image / PDF inline preview · binary download), emergency contacts. The customer portal at `/portal/organization` supports manual asset registration for users with asset-write permission. |
 | **Asset discovery** | Preview endpoints from an uploaded PCAP or PCAPNG, then add selected assets to the active workspace. |
@@ -85,18 +85,23 @@ dependencies are installed **inside Docker**. Self-signed TLS generation also
 uses the backend container, so setup does not install packages into system
 Python. Python itself must already be available to run the installer.
 
-The configuration prompts provide suggested values; press **Enter** to accept:
+Press **Enter** to accept the suggested values in the configuration prompts.
 
 1. **Hostname/IP:** a detected LAN IPv4 address; the detected hostname is also shown.
 2. **Transport:** HTTP, HTTPS with a generated certificate, or HTTPS with your certificate.
 3. **Listen port:** HTTP defaults to **8080**, HTTPS to **8443**. The chosen port drives the actual frontend/proxy mapping.
 4. **Administrator identities:** `admin@demo.local` for the dashboard and `super@detectmap.local` for product administration. A custom dashboard email is also written to the sign-in hint configuration.
-5. **Single environment** is the default and opens one workspace automatically. Choose **Multi-tenant** for separate customer or site workspaces.
-6. **Start fresh** is the default and skips the sample records. Choose **Add sample data** to explore the Acme and Globex examples. A single-environment setup with samples opens a sample workspace first.
 
-Setup builds and starts the stack and waits for the API. It asks for the
-deployment mode and initial data only after confirming the database is empty.
-It then initializes the two administrators and applies those choices. The dashboard administrator
+Setup builds and starts the stack, waits for the API, and checks whether the database is empty.
+On an empty deployment, choose the initial data for your tenant workspaces.
+
+- **Fresh deployment** is the default. Detect Map loads the shared ATT&CK catalog and creates an empty
+  tenant workspace. The Coverage Matrix shows known techniques as uncovered and APT Coverage shows
+  zero covered techniques. Add your use cases, map them to techniques, and register networks and assets.
+- **Sample data deployment** creates the Acme and Globex workspaces with mapped use cases, coverage
+  in the matrix and by APT group, gap analysis, networks, assets, and collection records.
+
+Setup initializes the two administrators. The dashboard administrator
 uses the credentials displayed on the login page: **`admin@demo.local` / `change-me`**
 by default. Under **Settings → Branding**, turn off **Show default credentials on
 the sign-in page** to hide the card; the administrator account remains active.
@@ -109,16 +114,9 @@ password, printed once after commit, and must change it on first login.
 Existing deployments, accounts, visibility settings, and customer data remain
 unchanged on normal reruns.
 
-Dashboard administrators can revisit both choices under **Settings → Deployment**.
-In single-environment mode, choose the workspace to use. Other workspaces and
-their records remain stored. Users assigned to those workspaces regain access
-when you switch back to multi-tenant mode.
-Turning sample data off hides only the sample workspaces managed by this setting.
-Turning it back on restores those workspaces with their records intact.
-If a sample workspace was active in single-environment mode, the app switches to
-a regular workspace or creates an empty one. The setting does not change
-shared reference catalogs, existing user-created workspaces, or workspaces
-created by the older manual demo scripts.
+Dashboard administrators can manage sample workspaces under **Settings → Environment**.
+Turning sample data on makes the managed examples available. Turning it off hides those
+workspaces and retains their records for later use.
 
 An existing `.env` is kept by default. Choosing to reconfigure updates only
 network settings, retaining database credentials, encryption keys, and other
@@ -131,8 +129,7 @@ python3 setup.py --keep-env --skip-reset
 
 A factory reset is available only with `--reset`, and setup asks for confirmation
 before dependency installation or deployment changes. It restores the configured
-dashboard default login and its credential card, and asks again for mode and
-sample data. Do not use it for an upgrade.
+dashboard default login and its credential card, and asks which data to start with.
 
 Dependency instructions are based on [Docker's Ubuntu](https://docs.docker.com/engine/install/ubuntu/),
 [Debian](https://docs.docker.com/engine/install/debian/), and
@@ -482,7 +479,7 @@ customer accounts under **Customers → select customer → Users**.
 detectmap/
 ├── docker-compose.yml          # db · redis · backend · worker · beat · frontend
 ├── docker-compose.tls.yml      # optional Caddy overlay
-├── setup.py                    # interactive installer (network, mode, sample data, factory reset)
+├── setup.py                    # interactive installer (network, initial data, factory reset)
 ├── .env.example
 ├── CLAUDE.md                   # design contract + roadmap
 ├── backend/
@@ -560,17 +557,10 @@ detectmap/
 
 ## Container reset / fresh start
 
-The explicit factory-reset option (`python3 setup.py --reset`) asks for confirmation before wiping the
-database back to a single-admin slate, preserving reference data
-(ATT&CK catalog, frameworks, sector profiles, D3FEND, SigmaHQ defaults)
-where the seeding pipeline can rebuild it. After a wipe:
-
-1. ATT&CK `refresh_all` (Enterprise + ICS + Mobile).
-2. Sector-profile seed.
-3. GRC framework seed (NIST CSF · ISO 27001 · NCA family).
-4. D3FEND ingest.
-5. SigmaHQ sync.
-6. `provision_customer` for each customer + `seed_dummy_data`.
+The explicit factory-reset option (`python3 setup.py --reset`) requires confirmation before
+replacing customer workspaces and accounts. Shared reference data is preserved. The installer
+then creates the administrators again and initializes a fresh workspace or the sample workspaces
+based on your choice.
 
 ---
 

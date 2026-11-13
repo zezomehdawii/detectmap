@@ -97,7 +97,8 @@ type TabKey =
 
 export default function SettingsPage() {
   const params = useSearchParams();
-  const initial = (params.get('tab') as TabKey) || 'branding';
+  const requestedTab = params.get('tab');
+  const initial = requestedTab === 'environment' ? 'deployment' : (requestedTab as TabKey) || 'branding';
   const [tab, setTab] = useState<TabKey>(initial);
 
   return (
@@ -107,7 +108,7 @@ export default function SettingsPage() {
           Settings
         </Typography>
         <Typography variant="body2" color="text.secondary">
-          Deployment, branding, catalog updates, and user management.
+          Environment, branding, catalog updates, and user management.
         </Typography>
       </Box>
 
@@ -119,7 +120,7 @@ export default function SettingsPage() {
         sx={{ borderBottom: 1, borderColor: 'divider' }}
       >
         <Tab label="Branding" value="branding" />
-        <Tab label="Deployment" value="deployment" />
+        <Tab label="Environment" value="deployment" />
         <Tab label="AI authoring" value="ai" />
         <Tab label="Active Directory" value="ldap" />
         <Tab label="Mail server" value="mail" />

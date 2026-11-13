@@ -150,16 +150,12 @@ async def current_tenant_user(
             if active_customer is None:
                 raise HTTPException(403, "Customer not found")
             if active_customer.mssp_org_id != user.mssp_org_id or not deployment.permits(active_customer):
-                raise HTTPException(403, "This environment is unavailable in the current deployment mode.")
+                raise HTTPException(403, "This workspace is unavailable.")
             # If the client sent X-Customer and it disagrees with the token,
             # that's a tampering signal — refuse.
             if x_customer and x_customer != active_customer.codename:
                 raise HTTPException(403, "X-Customer mismatch for customer user")
         else:
-            if deployment.mode == "single":
-                if x_customer and x_customer != deployment.active_customer:
-                    raise HTTPException(403, "This environment is unavailable in the current deployment mode.")
-                x_customer = deployment.active_customer
             if x_customer:
                 active_customer = (
                     await session.execute(

@@ -205,20 +205,23 @@ class InteractiveSetupFlowTests(unittest.TestCase):
             calls["status"].assert_called_once_with(["docker", "compose"], False)
             calls["initialize"].assert_called_once()
             self.assertEqual(calls["initialize"].call_args.args[2], values["DEFAULT_LOGIN_EMAIL"])
-            self.assertEqual(calls["initialize"].call_args.kwargs, {"mode": "single", "sample_data": "fresh"})
-            self.assertIn("Settings -> Deployment", calls["output"].getvalue())
+            self.assertEqual(calls["initialize"].call_args.kwargs, {"sample_data": "fresh"})
+            self.assertIn("Settings -> Environment", calls["output"].getvalue())
             calls["reset"].assert_not_called()
 
-    def test_empty_database_can_choose_multi_tenant_and_sample_data_with_saved_env(self):
-        choices = {"How will you use Detect Map?": "multi_tenant",
-                   "What data should Detect Map start with?": "sample"}
+    def test_empty_database_offers_only_fresh_or_sample_data_with_saved_env(self):
+        choices = {"What data should Detect Map start with?": "sample"}
         with isolated_project() as root:
             original_env, original_tls = seed_saved_configuration(root)
             with mocked_flow(["--keep-env"], choices=choices) as calls:
                 installer.main()
+                calls["choose"].assert_called_once()
+                question, options = calls["choose"].call_args.args
+                self.assertEqual(question, "What data should Detect Map start with?")
+                self.assertEqual([value for value, _label in options], ["fresh", "sample"])
                 calls["initialize"].assert_called_once_with(
                     ["docker", "compose"], False, None, "super@detectmap.local",
-                    mode="multi_tenant", sample_data="sample")
+                    sample_data="sample")
                 assert_kept_files(self, root, original_env, original_tls)
 
     def test_custom_fresh_admin_email_matches_the_configured_login_hint(self):
@@ -294,7 +297,7 @@ class InteractiveSetupFlowTests(unittest.TestCase):
                 installer.main()
                 assert_kept_files(self, root, original_env, original_tls)
                 self.assertIn("http://saved.example:8181", calls["output"].getvalue())
-                self.assertIn("Existing deployment detected", calls["output"].getvalue())
+                self.assertIn("Using the existing tenant workspaces", calls["output"].getvalue())
                 calls["initialize"].assert_not_called()
                 calls["choose"].assert_not_called()
                 calls["reset"].assert_not_called()
@@ -332,7 +335,7 @@ class InteractiveSetupFlowTests(unittest.TestCase):
                 self.assertTrue(any(call.kwargs.get("default", False) is False
                                     for call in calls["confirm"].call_args_list))
 
-    def test_confirmed_reset_prompts_for_new_mode_and_data_without_probing_empty_database(self):
+    def test_confirmed_reset_prompts_for_data_without_probing_empty_database(self):
         with isolated_project() as root:
             original_env, original_tls = seed_saved_configuration(root)
             with mocked_flow(["--reset", "--keep-env"], confirms=lambda *_args, **_kwargs: True,
@@ -342,7 +345,7 @@ class InteractiveSetupFlowTests(unittest.TestCase):
                 calls["initialize"].assert_not_called()
                 calls["reset"].assert_called_once_with(
                     ["docker", "compose"], False, None, "super@detectmap.local",
-                    mode="single", sample_data="sample")
+                    sample_data="sample")
                 assert_kept_files(self, root, original_env, original_tls)
 
     def test_reconfigure_changes_network_only_and_keeps_old_tls_material(self):
@@ -407,14 +410,15 @@ class ResetConfigurationTests(unittest.TestCase):
         with mock.patch.object(installer, "run_compose") as compose:
             installer.run_factory_reset(
                 ["docker", "compose"], False, "admin@demo.local", "super@detectmap.local",
-                mode="multi_tenant", sample_data="sample")
+                sample_data="sample")
         arguments = compose.call_args.args[1]
         self.assertIn("--use-login-defaults", arguments)
         self.assertIn("--yes", arguments)
         self.assertNotIn("--admin-password", arguments)
         self.assertNotIn("--super-password", arguments)
-        self.assertEqual(arguments[-6:], [
-            "--deployment-mode", "multi_tenant", "--sample-data", "sample",
+        self.assertNotIn("--deployment-mode", arguments)
+        self.assertEqual(arguments[-4:], [
+            "--sample-data", "sample",
             "--admin-email", "admin@demo.local",
         ])
 

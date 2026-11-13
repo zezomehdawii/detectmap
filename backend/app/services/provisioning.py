@@ -3,9 +3,7 @@
 Steps:
   1. CREATE SCHEMA cust_<codename> IF NOT EXISTS
   2. Run the customer Alembic migration tree against that schema
-  3. Copy `public.default_detections` into the tenant's `detections` table
-     with source='global' and upstream_global_id set; parse ATT&CK tags into
-     detection_techniques rows.
+  3. When requested for a demo, copy the shared Sigma rules and their mappings.
 
 Provisioning can share the transaction that creates the customer record.
 """
@@ -144,7 +142,7 @@ def _migrate_in_transaction(connection, schema: str) -> None:
 
 
 @asynccontextmanager
-async def provisioned_customer(session: AsyncSession, codename: str):
+async def provisioned_customer(session: AsyncSession, codename: str, *, seed_global_rules: bool = False):
     """Apply migrations and seed data inside the caller's transaction.
 
     The session is scoped to the new workspace inside the context. An
@@ -155,15 +153,16 @@ async def provisioned_customer(session: AsyncSession, codename: str):
     previous_path = await connection.scalar(text("SELECT current_setting('search_path')"))
     async with _migration_lock:
         await connection.run_sync(_migrate_in_transaction, schema)
-    await _seed_default_catalog(session, codename)
+    if seed_global_rules:
+        await _seed_default_catalog(session, codename)
     yield
     await session.execute(text("SELECT set_config('search_path', :path, true)"), {"path": previous_path})
     log.info("provisioned customer: %s -> %s", codename, schema)
 
 
-async def provision_customer(codename: str) -> None:
+async def provision_customer(codename: str, *, seed_global_rules: bool = False) -> None:
     """End-to-end provisioning. Idempotent."""
     async with AsyncSessionLocal() as session:
         async with session.begin():
-            async with provisioned_customer(session, codename):
+            async with provisioned_customer(session, codename, seed_global_rules=seed_global_rules):
                 pass

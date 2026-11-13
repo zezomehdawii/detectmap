@@ -3,9 +3,9 @@
 
 Run python3 setup.py from the repository root. The wizard checks Docker and
 Compose, offers supported dependency installation, suggests host/port values,
-builds application dependencies inside Docker, and initializes administrators
-only for an empty deployment. Existing environment keys and data are kept by
-default. --reset requires an explicit confirmation before any changes.
+builds application dependencies inside Docker, and initializes an empty tenant
+deployment with optional sample data. Existing environment keys and data are kept
+by default. --reset requires an explicit confirmation before any changes.
 """
 from __future__ import annotations
 
@@ -372,34 +372,28 @@ def deployment_is_empty(compose: list[str], tls: bool) -> bool:
     return status["empty"]
 
 
-def choose_initial_environment() -> tuple[str, str]:
-    mode = choose("How will you use Detect Map?", [
-        ("single", "Single environment — manage one organization or site"),
-        ("multi_tenant", "Multi-tenant — manage multiple separate environments"),
-    ], default="single")
-    sample_data = choose("What data should Detect Map start with?", [
-        ("fresh", "Start fresh — no sample records"),
-        ("sample", "Add sample data — explore the Acme and Globex example environments"),
+def choose_initial_data() -> str:
+    return choose("What data should Detect Map start with?", [
+        ("fresh", "Fresh deployment (ATT&CK reference catalog and empty tenant coverage and inventory)"),
+        ("sample", "Sample data deployment (example tenants with mapped use cases, gaps, networks, and assets)"),
     ], default="fresh")
-    print(d("  You can change both choices later under Settings -> Deployment."))
-    return mode, sample_data
 
 
 def run_initialization(compose: list[str], tls: bool, admin_email: str | None,
-                       super_email: str, *, mode: str, sample_data: str) -> None:
+                       super_email: str, *, sample_data: str) -> None:
     arguments = ["exec", "-T", "backend", "python", "-m",
                  "app.scripts.initialize_admins", "--super-email", super_email,
-                 "--deployment-mode", mode, "--sample-data", sample_data]
+                 "--sample-data", sample_data]
     if admin_email is not None:
         arguments += ["--admin-email", admin_email]
     run_compose(compose, arguments, tls=tls)
 
 
 def run_factory_reset(compose: list[str], tls: bool, admin_email: str | None,
-                      super_email: str, *, mode: str, sample_data: str) -> None:
+                      super_email: str, *, sample_data: str) -> None:
     arguments = ["exec", "-T", "backend", "python", "-m", "app.scripts.factory_reset",
                  "--yes", "--use-login-defaults", "--super-email", super_email,
-                 "--deployment-mode", mode, "--sample-data", sample_data]
+                 "--sample-data", sample_data]
     if admin_email is not None:
         arguments += ["--admin-email", admin_email]
     run_compose(compose, arguments, tls=tls)
@@ -509,17 +503,17 @@ def main() -> None:
     wait_for_backend(compose, use_tls)
     header("7. Initial deployment")
     if args.reset or deployment_is_empty(compose, use_tls):
-        mode, sample_data = choose_initial_environment()
+        sample_data = choose_initial_data()
         initialize = run_factory_reset if args.reset else run_initialization
-        initialize(compose, use_tls, admin_email, super_email, mode=mode, sample_data=sample_data)
+        initialize(compose, use_tls, admin_email, super_email, sample_data=sample_data)
     else:
-        print(d("  Existing deployment detected; accounts, deployment mode, and data are unchanged."))
+        print(d("  Using the existing tenant workspaces, accounts, and settings."))
     header("Done")
     print(f"  Dashboard: {deployment['public_url']}")
     print("  Fresh installs use the default dashboard administrator shown on the sign-in page.")
     print("  Hide that credential card under Settings -> Branding; this does not disable the account.")
     print("  A new product super admin receives a generated temporary password and must change it on first sign-in.")
-    print("  Change deployment mode or sample data under Settings -> Deployment.")
+    print("  Manage sample workspaces in the dashboard under Settings -> Environment.")
     if tls_mode == "self-signed":
         print("  Configure trust for your generated certificate before browser access.")
 

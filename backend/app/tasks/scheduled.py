@@ -133,7 +133,6 @@ def scheduled_snapshot(self) -> dict:
                     .where(
                         Customer.status == CustomerStatus.ACTIVE,
                         or_(MSSPOrg.sample_data_enabled, Customer.sample_dataset.is_(None)),
-                        or_(MSSPOrg.deployment_mode != "single", MSSPOrg.single_customer == Customer.codename),
                     )
                 )
             ).scalars().all()

@@ -168,7 +168,7 @@ CUSTOM_DETECTIONS = {
         {
             "sigma_id": "globex-custom-001",
             "title": "Globex OT — Modbus FC=43 anomaly on PLC ring",
-            "techniques": ["T0855"],
+            "techniques": ["T1692.001", "T0855"],
             "level": SigmaLevel.HIGH,
             "status": DetectionStatus.DEPLOYED,
             "depth": 3,
@@ -357,7 +357,7 @@ async def _seed_custom_detections(session: AsyncSession, dataset: str) -> None:
                     id=uuid.uuid4(),
                     detection_id=det_id,
                     technique_id=t,
-                    domain="ics" if t.startswith("T0") else "enterprise",
+                    domain="ics" if t.startswith("T0") or t == "T1692.001" else "enterprise",
                 )
             )
 

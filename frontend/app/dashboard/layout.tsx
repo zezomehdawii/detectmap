@@ -63,6 +63,7 @@ import {
   clearToken,
   getActiveCustomer,
   getToken,
+  hasCustomerSelection,
   setActiveCustomer,
 } from '@/lib/auth';
 import { FeaturesProvider } from '@/lib/features';
@@ -90,8 +91,6 @@ import { AttackNotificationsMenu } from './AttackNotificationsMenu';
 
 const DRAWER_WIDTH = 248;
 const DRAWER_WIDTH_COLLAPSED = 64;
-const PORTFOLIO_PATH = '/dashboard/portfolio';
-const CUSTOMERS_PATH = '/dashboard/customers';
 
 type NavItem = { label: string; href: string; icon: React.ReactNode };
 type NavGroup = { heading: string; items: NavItem[] };
@@ -152,10 +151,6 @@ export default function AuthedLayout({ children }: { children: React.ReactNode }
   const [notifs, setNotifs] = useState<AttackNotification[]>([]);
   const [notifAnchor, setNotifAnchor] = useState<HTMLElement | null>(null);
   const [prefsOpen, setPrefsOpen] = useState(false);
-  const singleEnvironment = deployment?.mode === 'single';
-  const portfolioUnavailable = singleEnvironment &&
-    (pathname === PORTFOLIO_PATH || pathname.startsWith(PORTFOLIO_PATH + '/'));
-
   useEffect(() => {
     if (!getToken()) {
       router.replace('/login');
@@ -182,25 +177,20 @@ export default function AuthedLayout({ children }: { children: React.ReactNode }
         setMe(meRes);
         const isMssp = meRes.role.startsWith('mssp_');
         if (isMssp) {
-          // Legacy servers lack deployment settings. Their dashboard keeps
-          // the existing customer switcher and portfolio behavior.
-          const settings = await getDeploymentSettings().catch(() => null);
+          const [settings, list] = await Promise.all([
+            getDeploymentSettings().catch(() => null),
+            listCustomers().catch(() => null),
+          ]);
           setDeployment(settings);
-          if (settings?.mode === 'single') {
-            setActive(settings.active_customer);
-            setActiveCustomer(settings.active_customer);
-          } else {
-            // A stored selection can disappear when sample data is hidden.
-            const list = await listCustomers().catch(() => null);
-            const stored = getActiveCustomer();
-            if (list) {
-              setCustomers(list);
-              if (stored && !list.some((c) => c.codename === stored)) {
-                setActiveCustomer(null);
-              }
-            }
-            setActive(getActiveCustomer());
+          if (list) setCustomers(list);
+          const stored = getActiveCustomer();
+          const unavailable = stored && list && !list.some((customer) => customer.codename === stored);
+          if (unavailable || !hasCustomerSelection()) {
+            // A hidden sample may invalidate the selection. Use the setup workspace
+            // if one is available, or return to the portfolio.
+            setActiveCustomer(settings?.initial_customer ?? null);
           }
+          setActive(getActiveCustomer());
         } else if (meRes.customer_codename) {
           setActive(meRes.customer_codename);
           setActiveCustomer(meRes.customer_codename);
@@ -213,10 +203,6 @@ export default function AuthedLayout({ children }: { children: React.ReactNode }
       }
     })();
   }, [router]);
-
-  useEffect(() => {
-    if (portfolioUnavailable) router.replace('/dashboard');
-  }, [portfolioUnavailable, router]);
 
   useEffect(() => {
     const handler = (e: Event) => {
@@ -294,7 +280,7 @@ export default function AuthedLayout({ children }: { children: React.ReactNode }
     <PreferencesProvider>
       <ColorModePrefsBridge />
       <Box sx={{ display: 'flex', minHeight: '100vh', bgcolor: 'background.default' }}>
-        <SidebarNav pathname={pathname} singleEnvironment={singleEnvironment} />
+        <SidebarNav pathname={pathname} />
 
       <Box sx={{ flex: 1, display: 'flex', flexDirection: 'column', minWidth: 0 }}>
         <AppBar position="sticky" elevation={0}>
@@ -306,19 +292,14 @@ export default function AuthedLayout({ children }: { children: React.ReactNode }
                   color={i === arr.length - 1 ? 'text.primary' : 'text.secondary'}
                   sx={{ fontWeight: i === arr.length - 1 ? 600 : 400 }}
                 >
-                  {singleEnvironment && c === 'customers' ? 'environment' : c}
+                  {c}
                 </Typography>
               ))}
             </Breadcrumbs>
 
-            {singleEnvironment && activeEnvironment && (
-              <Typography variant="body2" color="text.secondary" noWrap>
-                {activeEnvironment.name}
-              </Typography>
-            )}
             {activeEnvironment?.is_sample && <Chip label="Sample data" size="small" color="info" variant="outlined" />}
 
-            {isMssp && !singleEnvironment && (
+            {isMssp && (
               <>
                 <Tooltip title="Switch active customer">
                   <Button
@@ -481,7 +462,7 @@ export default function AuthedLayout({ children }: { children: React.ReactNode }
           sx={{ flex: 1, p: { xs: 2, md: 4 } }}
         >
           <DeploymentContext.Provider value={deployment}>
-            <FeaturesProvider>{portfolioUnavailable ? null : children}</FeaturesProvider>
+            <FeaturesProvider>{children}</FeaturesProvider>
           </DeploymentContext.Provider>
         </Box>
       </Box>
@@ -489,7 +470,6 @@ export default function AuthedLayout({ children }: { children: React.ReactNode }
       <SearchPalette
         open={searchOpen}
         onClose={() => setSearchOpen(false)}
-        singleEnvironment={singleEnvironment}
       />
       <AttackNotificationsMenu
         anchorEl={notifAnchor}
@@ -605,7 +585,7 @@ function PreferencesDialog({
   );
 }
 
-function SidebarNav({ pathname, singleEnvironment }: { pathname: string; singleEnvironment: boolean }) {
+function SidebarNav({ pathname }: { pathname: string }) {
   const { get, set } = useUserPrefs();
   const collapsed = !!get<boolean>('sidebar_collapsed', false);
   const width = collapsed ? DRAWER_WIDTH_COLLAPSED : DRAWER_WIDTH;
@@ -674,14 +654,12 @@ function SidebarNav({ pathname, singleEnvironment }: { pathname: string; singleE
                     pl: 3,
                   }}
                 >
-                  {singleEnvironment && group.heading === 'MSSP' ? 'Administration' : group.heading}
+                  {group.heading}
                 </ListSubheader>
               )
             }
           >
             {group.items.map((item) => {
-              if (singleEnvironment && item.href.startsWith(PORTFOLIO_PATH)) return null;
-              const label = singleEnvironment && item.href === CUSTOMERS_PATH ? 'Environment' : item.label;
               const selected =
                 item.href === '/dashboard'
                   ? pathname === '/dashboard'
@@ -706,14 +684,14 @@ function SidebarNav({ pathname, singleEnvironment }: { pathname: string; singleE
                   </ListItemIcon>
                   {!collapsed && (
                     <ListItemText
-                      primary={label}
+                      primary={item.label}
                       primaryTypographyProps={{ fontSize: '0.875rem', fontWeight: 500 }}
                     />
                   )}
                 </ListItemButton>
               );
               return collapsed ? (
-                <Tooltip key={item.href} title={label} placement="right">
+                <Tooltip key={item.href} title={item.label} placement="right">
                   {button}
                 </Tooltip>
               ) : (
