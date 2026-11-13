@@ -64,7 +64,7 @@ _SAMPLES = {
         "gap": "T0843",
         "domain": "ics",
         "plan": "Collect controller program changes",
-        "planned_source": "Operational Databases",
+        "planned_source": "Application Log Content",
     },
 }
 
