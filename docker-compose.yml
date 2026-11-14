@@ -1,6 +1,7 @@
 services:
   db:
     image: postgres:15-alpine
+    restart: unless-stopped
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-detectmap}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-detectmap}
@@ -17,6 +18,7 @@ services:
 
   redis:
     image: redis:7-alpine
+    restart: unless-stopped
     ports:
       - "6379:6379"
     healthcheck:
@@ -27,6 +29,7 @@ services:
 
   backend:
     build: ./backend
+    restart: unless-stopped
     env_file: .env
     depends_on:
       db:
@@ -44,6 +47,7 @@ services:
 
   worker:
     build: ./backend
+    restart: unless-stopped
     env_file: .env
     depends_on:
       - backend
@@ -54,6 +58,7 @@ services:
 
   beat:
     build: ./backend
+    restart: unless-stopped
     env_file: .env
     depends_on:
       - backend
@@ -67,6 +72,7 @@ services:
   # compiled on-demand and navigation is instant. No source mounting: the
   # served app is the built image, not live host files.
   frontend:
+    restart: unless-stopped
     build:
       context: ./frontend
       args:

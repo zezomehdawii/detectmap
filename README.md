@@ -151,6 +151,30 @@ docker compose exec backend python -m app.scripts.bootstrap \
 
 The bootstrap script is idempotent.
 
+### Start Detect Map on Linux boot
+
+Compose gives every Detect Map service, including the optional Caddy proxy,
+the `unless-stopped` restart policy. On a Linux host with systemd, enable Docker
+and containerd to start at boot:
+
+```bash
+sudo systemctl enable --now docker.service containerd.service
+```
+
+For an existing, running deployment created before this change, use the command
+below to set the policy on its containers in place. Replace `detectmap` with your
+Compose project name if you used a different name.
+
+```bash
+sudo systemctl enable --now docker.service containerd.service && ids=$(sudo docker ps -aq --filter label=com.docker.compose.project=detectmap --filter label=com.docker.compose.oneoff=False) && [ -n "$ids" ] && sudo docker update --restart unless-stopped $ids
+```
+
+The update takes effect without rebuilding containers or changing their volumes.
+Docker restarts the running stack after a reboot. For containers that are already
+stopped, follow the command with `docker compose start`. If you removed the containers
+with `docker compose down`, use `docker compose up -d`. Use the same Compose files
+and project name as your deployment for either command.
+
 ### Generating secrets by hand
 
 ```bash
